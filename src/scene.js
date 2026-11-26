@@ -695,7 +695,6 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     try {
       await animate(560, (t) => {
         rotation = start + degrees * ease(t); boardRoot.rotation.y = rotation * Math.PI / 180;
-        resize();
       });
       rotation = ((start + degrees) % 360 + 360) % 360; boardRoot.rotation.y = rotation * Math.PI / 180;
     } finally { viewBusy = false; if (!disposed) { resize(); notifyViewState(); } }
@@ -786,7 +785,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     try {
       await animate(460, (t) => {
         const progress = ease(t); rotation = start * (1 - progress); boardRoot.rotation.y = rotation * Math.PI / 180;
-        heights.forEach((height, i) => updateTileHeight(terrain, i, height * (1 - progress))); resize();
+        heights.forEach((height, i) => updateTileHeight(terrain, i, height * (1 - progress)));
       });
       rotation = 0; boardRoot.rotation.y = 0;
       terrain.heights.forEach((_, i) => updateTileHeight(terrain, i, 0));
@@ -835,12 +834,40 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   const pointerCancel = () => { down = null; };
   canvas.addEventListener('pointermove', pointerMove); canvas.addEventListener('pointerleave', pointerLeave);
   canvas.addEventListener('pointerdown', pointerDown); canvas.addEventListener('pointerup', pointerUp); canvas.addEventListener('pointercancel', pointerCancel);
+  const fixedFitCache = new WeakMap();
+  const fixedRotationRadius = (terrain, aspect, usable, width, targetY) => {
+    const key = [aspect, usable, width, targetY].join(':');
+    const cached = fixedFitCache.get(terrain);
+    if (cached?.key === key) return cached.radius;
+    // A rotating point traces a horizontal circle. Maximise each perspective
+    // frustum inequality over that entire circle, independent of the current yaw.
+    // Babylon's default FOV mode is vertical-fixed; horizontal FOV uses aspect.
+    const tan = Math.tan(camera.fov / 2);
+    const tanV = tan * (1 - Math.min(0.10, 24 / usable));
+    const tanH = tan * aspect * (1 - Math.min(0.10, 24 / width));
+    const sine = Math.sin(camera.beta), cosine = Math.cos(camera.beta);
+    let radius = 0;
+    const include = (rho, y) => {
+      const localY = y - targetY, near = localY * cosine;
+      radius = Math.max(radius,
+        near + localY * sine / tanV + rho * Math.abs(-sine + cosine / tanV),
+        near - localY * sine / tanV + rho * Math.abs(-sine - cosine / tanV),
+        near + rho * Math.hypot(sine, 1 / tanH));
+    };
+    terrain.groundTiles.forEach((tile, index) => {
+      const positions = tile.getVerticesData('position'), center = flatCoord(index, terrain.size);
+      for (let i = 0; i < positions.length; i += 3) {
+        include(Math.hypot(center.x + positions[i] * STEP, center.z + positions[i + 2] * STEP), positions[i + 1]);
+      }
+    });
+    fixedFitCache.set(terrain, { key, radius });
+    return radius;
+  };
   const resize = () => {
     if (disposed) return;
     engine.resize(); const width = canvas.clientWidth || 1, height = canvas.clientHeight || 1;
     const mobile = width <= 760, short = height < 600;
     const dropDepth = -Math.min(0, ...activeTerrain().heights);
-    const yawFit = 1 + (Math.abs(Math.cos(boardRoot.rotation.y)) + Math.abs(Math.sin(boardRoot.rotation.y)) - 1) * 0.85;
     if (boardPreviewSize !== null) {
       const top = short ? 135 : mobile ? 150 : 140, bottom = 40;
       const usable = Math.max(130, height - top - bottom), aspect = width / usable;
@@ -849,7 +876,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       camera.setTarget(new Vector3(0, -0.12 - dropDepth * 0.30, 0)); camera.alpha = -Math.PI / 2; camera.beta = 0.94;
       const span = boardPreviewSize * STEP, focal = 2 * Math.tan(camera.fov / 2);
       const baseRadius = Math.max(3.8, 1.3 + (span + 0.70) / (focal * aspect), 1.1 + (span * Math.cos(camera.beta) + 1.05) / focal) + (boardPreviewSize - 1) * 0.50;
-      camera.radius = baseRadius * yawFit + dropDepth * 0.95;
+      camera.radius = Math.max(baseRadius, fixedRotationRadius(activeTerrain(), aspect, usable, width, camera.target.y)) + dropDepth * 0.95;
       return;
     }
     const top = mobile ? (short ? 95 : 150) : (short ? 80 : 100);
@@ -862,7 +889,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     // Long focal length keeps the rear row a little narrower, without diamond rotation.
     const aspect = width / usable;
     camera.setTarget(new Vector3(0, 0.30 - dropDepth * 0.30, 0)); camera.alpha = -Math.PI / 2; camera.beta = 0.94;
-    camera.radius = Math.max(mobile ? 12.3 : 10.9, 1.9 + 6.65 / (2 * Math.tan(camera.fov / 2) * aspect)) * yawFit + dropDepth * 0.95;
+    camera.radius = Math.max(mobile ? 12.3 : 10.9, 1.9 + 6.65 / (2 * Math.tan(camera.fov / 2) * aspect), fixedRotationRadius(battleTerrain, aspect, usable, width, camera.target.y)) + dropDepth * 0.95;
     actors.forEach((actor) => { actor.label.style.width = mobile ? '72px' : '82px'; });
   };
   let savedBattleCamera = null, savedLabelVisibility = '';
@@ -911,6 +938,12 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     scene.render();
     if (boardPreviewSize !== null) return;
     const placed = [];
+    const controls = canvas.parentElement.querySelector('.board-layout-controls');
+    if (controls?.getClientRects().length) {
+      const bounds = controls.getBoundingClientRect(), canvasBounds = canvas.getBoundingClientRect();
+      placed.push({ left: bounds.left - canvasBounds.left, right: bounds.right - canvasBounds.left,
+        top: bounds.top - canvasBounds.top, bottom: bounds.bottom - canvasBounds.top });
+    }
     const visibleActors = [...actors.values()].filter((actor) => {
       if (!actor.root.isEnabled() || actor.label.hidden) { actor.leader.hidden = true; return false; }
       return true;
@@ -921,10 +954,11 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       actor.label.style.display = '';
       const width = canvas.clientWidth <= 760 ? 72 : 82, height = actor.label.offsetHeight || 43;
       let chosen = null;
-      for (const dy of [0, -height - 7]) {
+      for (const dy of [0, -height - 7, height + 7, 2 * (height + 7)]) {
         for (const dx of [actor.labelOffset, 0, width + 9, -width - 9, 2 * width + 12, -2 * width - 12]) {
           const x = clamp(p.x + dx, width / 2 + 6, canvas.clientWidth - width / 2 - 6), y = p.y + dy;
           const box = { left: x - width / 2, right: x + width / 2, top: y - height, bottom: y };
+          if (box.top < 6 || box.bottom > canvas.clientHeight - 6) continue;
           const overlaps = placed.some((r) => box.left < r.right + 5 && box.right > r.left - 5 && box.top < r.bottom + 5 && box.bottom > r.top - 5);
           if (!overlaps) { chosen = { x, y, box }; break; }
         }
