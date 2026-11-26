@@ -45,7 +45,7 @@ test('resizing a nine-slice block preserves world-space caps and source UVs', ()
   }
 });
 
-test('grass is one connected surface with open edges only along its bottom', () => {
+test('grass is one connected surface with open edges only along its irregular bottom', () => {
   const engine = new NullEngine();
   const scene = new Scene(engine);
   try {
@@ -81,7 +81,7 @@ test('grass is one connected surface with open edges only along its bottom', () 
     for (const edge of edges.values()) assert.ok(edge.uses <= 2, 'a surface edge cannot belong to more than two triangles');
     for (const edge of open) {
       for (const vertex of edge.ends) {
-        assert.ok(Math.abs(positions[vertex * 3 + 1] - bottom) < 1e-8, 'an open edge above the bottom would expose an internal seam');
+        assert.ok(positions[vertex * 3 + 1] - bottom < 0.060, 'open edges must remain within the 6 cm irregular grass hem; a higher edge exposes an internal seam');
       }
     }
   } finally {

@@ -26,6 +26,13 @@ document.querySelector('#app').innerHTML = `
 <main class="battle" aria-label="빛이 있으라 전술 카드 전투">
   <canvas id="world" tabindex="0" aria-label="5 곱하기 5 전장. 카드 선택 후 방향키로 칸 이동, Enter로 사용." aria-describedby="keyboard-help"></canvas>
   <div class="scene-shade" aria-hidden="true"></div><div id="unit-labels"></div>
+  <div class="board-layout-controls" role="group" aria-label="블록 배열 미리보기">
+    <div class="board-layout-buttons">
+      ${[1, 2, 3, 4, 5].map(size => `<button type="button" data-board-size="${size}" aria-pressed="false" aria-label="${size} 곱하기 ${size} 블록 배열 미리보기" disabled>${size}×${size}</button>`).join('')}
+      <button type="button" id="return-to-battle" aria-pressed="true" aria-label="전투 화면으로 돌아가기" disabled>전투로</button>
+    </div>
+    <p id="board-preview-status" role="status" aria-live="polite" hidden></p>
+  </div>
   <header class="battle-header">
     <div class="turn-banner"><span class="turn-ornament" aria-hidden="true"></span><div><span id="turn-count">첫 번째 전투</span><strong id="turn-phase">당신의 차례</strong></div><span class="turn-ornament" aria-hidden="true"></span></div>
     <div class="header-actions"><button class="text-button" id="restart-button">새 전투</button></div>
@@ -51,11 +58,37 @@ try {
   if (raw) { const restored = parseSave(raw); if (restored) state = restored; else invalidSave = true; }
 } catch { storageAvailable = false; }
 let world, selectedUid = null, hoverTile = null, focusTile = state.hero.tile;
-let busy = false, disposed = false, toastTimer;
+let busy = false, disposed = false, toastTimer, previewSize = null;
 const canvas = document.querySelector('#world');
 const handRoot = document.querySelector('#card-hand');
 const dialogs = [...document.querySelectorAll('dialog')];
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const battleCanvasLabel = canvas.getAttribute('aria-label');
+const layoutButtons = [...document.querySelectorAll('[data-board-size], #return-to-battle')];
+
+function setBoardPreview(size) {
+  if (!world || busy || dialogs.some(dialog => dialog.open) || size === previewSize) return;
+  world.setBoardPreview(size);
+  previewSize = size;
+  const previewing = size !== null;
+  const battle = document.querySelector('.battle');
+  battle.classList.toggle('board-preview', previewing);
+  battle.setAttribute('aria-label', previewing ? '블록 배열 미리보기' : '빛이 있으라 전술 카드 전투');
+  layoutButtons.forEach(button => button.setAttribute('aria-pressed', String(button.dataset.boardSize ? Number(button.dataset.boardSize) === size : !previewing)));
+  const status = document.querySelector('#board-preview-status');
+  status.hidden = !previewing;
+  status.textContent = previewing ? `${size}×${size} · ${size * size}개 블록` : '';
+  canvas.setAttribute('aria-label', previewing ? `${size} 곱하기 ${size} 블록 배열 미리보기` : battleCanvasLabel);
+  canvas.setAttribute('aria-describedby', previewing ? 'board-preview-status' : 'keyboard-help');
+  canvas.tabIndex = previewing ? -1 : 0;
+  canvas.style.cursor = 'default';
+  hoverTile = null;
+  world.setFocus(null);
+  clearTimeout(toastTimer);
+  document.querySelector('#toast').classList.remove('visible');
+  if (!previewing) world.sync(state);
+  renderHud();
+}
 
 function announce(message) {
   const toast = document.querySelector('#toast');
@@ -81,6 +114,7 @@ function renderHand() {
   const hadFocus = document.activeElement?.closest('[data-card]')?.dataset.card;
   const scroll = handRoot.scrollLeft;
   handRoot.innerHTML = state.hand.map((entry, index) => cardMarkup(entry, index, state.hand.length)).join('');
+  if (previewSize !== null) handRoot.querySelectorAll('button').forEach(button => { button.disabled = true; });
   handRoot.scrollLeft = scroll;
   if (hadFocus) ([...handRoot.querySelectorAll('[data-card]')].find(button => button.dataset.card === hadFocus) ?? canvas).focus({ preventScroll: true });
   document.querySelector('#hand-count').textContent = `${state.hand.length}장`;
@@ -94,12 +128,14 @@ function renderHud() {
   document.querySelector('#draw-count').textContent = state.drawPile.length;
   document.querySelector('#discard-count').textContent = state.discardPile.length;
   document.querySelector('#battle-log').replaceChildren(...state.log.slice(-2).map(entry => { const line = document.createElement('p'); line.textContent = typeof entry === 'string' ? entry : entry.message ?? ''; return line; }));
-  document.querySelector('#end-turn').disabled = busy || state.phase !== 'player' || !world;
-  document.querySelector('#restart-button').disabled = busy;
+  document.querySelector('#end-turn').disabled = previewSize !== null || busy || state.phase !== 'player' || !world;
+  document.querySelector('#restart-button').disabled = previewSize !== null || busy;
+  layoutButtons.forEach(button => { button.disabled = busy || !world; });
   renderHand(); updateTargeting();
 }
 function updateTargeting(tile = hoverTile) {
   const prompt = document.querySelector('#prompt-text'), cancel = document.querySelector('#cancel-card');
+  if (previewSize !== null) { world?.showTargeting(null); return; }
   if (busy) { world?.showTargeting(null); cancel.hidden = true; prompt.textContent = '수호자와 그림자가 행동하고 있습니다'; return; }
   const entry = state.hand.find(card => card.uid === selectedUid);
   cancel.hidden = !entry;
@@ -120,13 +156,13 @@ function updateTargeting(tile = hoverTile) {
   }
 }
 function selectCard(uid, keyboard = false) {
-  if (busy || state.phase !== 'player' || !world || dialogs.some(dialog => dialog.open)) return;
+  if (previewSize !== null || busy || state.phase !== 'player' || !world || dialogs.some(dialog => dialog.open)) return;
   selectedUid = selectedUid === uid ? null : uid; hoverTile = null;
   renderHand(); updateTargeting();
   if (keyboard) { canvas.focus({ preventScroll: true }); world.setFocus(focusTile); updateTargeting(focusTile); }
 }
 function cancelSelection() {
-  if (busy) return;
+  if (previewSize !== null || busy) return;
   selectedUid = null; hoverTile = null; world?.setFocus(null); renderHand(); updateTargeting();
 }
 function showOutcome() {
@@ -152,33 +188,34 @@ async function execute(result, enemyTurn = false) {
   showOutcome();
 }
 function clickTile(tile) {
-  if (!world || busy || state.phase !== 'player' || dialogs.some(dialog => dialog.open)) return;
+  if (previewSize !== null || !world || busy || state.phase !== 'player' || dialogs.some(dialog => dialog.open)) return;
   focusTile = tile;
   if (!selectedUid) { announce('아래에서 사용할 카드를 먼저 골라 주세요.'); return; }
   execute(playCard(state, selectedUid, tile));
 }
 function finishTurn() {
-  if (!world || busy || state.phase !== 'player' || dialogs.some(dialog => dialog.open)) return;
+  if (previewSize !== null || !world || busy || state.phase !== 'player' || dialogs.some(dialog => dialog.open)) return;
   execute(endTurn(state), true);
 }
 function restart() {
-  if (busy) return;
+  if (previewSize !== null || busy) return;
   state = freshGame(); selectedUid = null; hoverTile = null; focusTile = state.hero.tile;
   dialogs.forEach(dialog => { if (dialog.open) dialog.close(); });
   world?.sync(state); world?.setFocus(null); save(); renderHud(); announce('새로운 전투가 시작되었습니다.');
 }
 
 handRoot.addEventListener('click', event => { const button = event.target.closest('[data-card]'); if (button) selectCard(button.dataset.card); });
+layoutButtons.forEach(button => button.addEventListener('click', () => setBoardPreview(button.dataset.boardSize ? Number(button.dataset.boardSize) : null)));
 document.querySelector('#cancel-card').addEventListener('click', cancelSelection);
 document.querySelector('#end-turn').addEventListener('click', finishTurn);
-document.querySelector('#restart-button').addEventListener('click', () => { if (!busy) document.querySelector('#restart-dialog').showModal(); });
+document.querySelector('#restart-button').addEventListener('click', () => { if (!busy && previewSize === null) document.querySelector('#restart-dialog').showModal(); });
 document.querySelector('#confirm-restart').addEventListener('click', restart);
 document.querySelector('#play-again').addEventListener('click', restart);
 document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => document.getElementById(button.dataset.close).close()));
 document.querySelector('#outcome-dialog').addEventListener('cancel', event => event.preventDefault());
 canvas.addEventListener('contextmenu', event => { event.preventDefault(); cancelSelection(); });
 document.addEventListener('keydown', event => {
-  if (busy || dialogs.some(dialog => dialog.open) || event.altKey || event.ctrlKey || event.metaKey || state.phase !== 'player') return;
+  if (previewSize !== null || busy || dialogs.some(dialog => dialog.open) || event.altKey || event.ctrlKey || event.metaKey || state.phase !== 'player') return;
   if (event.key === 'Escape') { cancelSelection(); return; }
   if (event.key.toLowerCase() === 'e') { event.preventDefault(); finishTurn(); return; }
   if (/^[1-5]$/.test(event.key)) { const card = state.hand[Number(event.key) - 1]; if (card) { event.preventDefault(); selectCard(card.uid, true); } return; }
@@ -198,7 +235,7 @@ async function boot() {
   try {
     world = await createWorld(canvas, {
       state, onTileClick: clickTile,
-      onHover: tile => { hoverTile = tile; canvas.style.cursor = selectedUid && tile !== null && !busy ? 'crosshair' : 'default'; updateTargeting(tile); },
+      onHover: tile => { if (previewSize !== null) return; hoverTile = tile; canvas.style.cursor = selectedUid && tile !== null && !busy ? 'crosshair' : 'default'; updateTargeting(tile); },
       reducedMotion, labelsRoot: document.querySelector('#unit-labels'),
     });
     world.sync(state); renderHud(); document.querySelector('#loading-screen').classList.add('loaded');
