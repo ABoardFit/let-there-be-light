@@ -117,16 +117,19 @@ class SharedEarthBlend extends MaterialPluginBase {
       `,
       CUSTOM_FRAGMENT_BEFORE_FOG: `
         float terrainNoise = terrainBlendNoise(vPositionW.xz * 8.0);
-        float terrainMix = 1.0 - smoothstep(-0.005, 0.125 + (terrainNoise - 0.5) * 0.10, vPositionW.y);
+        float terrainMix = 1.0 - smoothstep(-0.005, 0.16 + (terrainNoise - 0.5) * 0.10, vPositionW.y);
         if (terrainMix > 0.001) {
           float terrainFingers = (terrainBlendNoise(vec2(vPositionW.x * 4.5, 11.0)) - 0.5) * 0.12;
           float terrainY = vPositionW.y + terrainFingers;
           // Sample only the original stone, excluding the painted grass header.
           // World-space phase stays identical on both sides of the grass/earth join.
-          float terrainV = 0.49 + (terrainY + 0.045) * 0.20;
+          // Match vertical texel density to the horizontal projection. Mirror only
+          // opaque stone rows, so neither the painted grass header nor alpha roots repeat.
+          float terrainPhase = (terrainY * 0.45 + 0.029) / 0.14;
+          float terrainV = 0.43 + 0.07 * (1.0 - abs(fract(terrainPhase) * 2.0 - 1.0));
           vec2 terrainUV = vec2(
             clamp(0.025 + (vPositionW.x + 2.9) / 5.8 * 0.95, 0.04, 0.96),
-            clamp(terrainV, 0.32, 0.525)
+            terrainV
           );
           vec4 terrainSample = texture2D(terrainEarthSampler, terrainUV);
           // The colour projection must never sample the transparent silhouette as black.
@@ -219,13 +222,13 @@ export function nineSliceAxis(value, halfExtent, capWidth, uvStart, uvEnd, uvCap
   return uvStart + uvCap + (value - low - capWidth) / (2 * (halfExtent - capWidth)) * (uvEnd - uvStart - 2 * uvCap);
 }
 
-export function createNineSliceBlock(scene, seed = 0, frontArt = false, { width = 0.99, depth = 0.99, capWidth = 0.125, capDepth = capWidth } = {}) {
+export function createNineSliceBlock(scene, seed = 0, frontArt = false, { width = 1.002, depth = 1.002, capWidth = 0.055, capDepth = capWidth } = {}) {
   if (width <= capWidth * 2 || depth <= capDepth * 2 || Math.min(capWidth, capDepth) <= 0) throw new RangeError('Nine-slice caps must fit inside the block.');
   const mesh = new Mesh('nine-slice-earth-block-' + seed, scene), r = randomSource(701 + seed * 47);
   const uvRandom = randomSource(113 + seed * 61), uvTurn = Math.floor(uvRandom() * 4);
   const uvSpan = 0.43, uvOffsetU = uvRandom() * (1 - uvSpan), uvOffsetV = uvRandom() * (1 - uvSpan), uvCap = 0.065;
   const halfX = width / 2, halfZ = depth / 2, coreX = halfX - capWidth, coreZ = halfZ - capDepth;
-  const curveDrop = 0.125, edgeHeight = TURF_HEIGHT - curveDrop, grassBottom = -0.045, segments = 8, wrapSegments = 2;
+  const curveDrop = 0.055, edgeHeight = TURF_HEIGHT - curveDrop, grassBottom = -0.045, segments = 8, wrapSegments = 2;
   const positions = [], indices = [], uvs = [], normals = [], welded = new Map(), patches = [];
   const curveBoundary = new Set(), soilBoundary = new Set();
   let patchVertices;
@@ -519,20 +522,37 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
       frontMaterial.alphaCutOff = 0.48; frontMaterial.backFaceCulling = false;
       for (let col = 0; col < boardSize; col++) {
         const block = groundTiles[(boardSize - 1) * boardSize + col], profile = block.metadata.nineSlice;
-        const width = (profile.width - 0.020) * STEP, height = profile.bodyDepth * 0.80;
+        const width = (profile.width - 0.012) * STEP, height = profile.bodyDepth * 0.80;
         const centerX = block.position.x, top = profile.grassBottom + 0.002;
-        const uvTop = 0.64, uvBottom = 0.30;
+        const leftExtent = col > 0 ? STEP / 2 : width / 2;
+        const rightExtent = col < boardSize - 1 ? STEP / 2 : width / 2;
+        const leftHeight = col > 0 ? (height + groundTiles[(boardSize - 1) * boardSize + col - 1].metadata.nineSlice.bodyDepth * 0.80) / 2 : height;
+        const rightHeight = col < boardSize - 1 ? (height + groundTiles[(boardSize - 1) * boardSize + col + 1].metadata.nineSlice.bodyDepth * 0.80) / 2 : height;
+        // Keep the original stone colour, but finish on a broad eroded geometry profile.
+        // The image's thin dangling alpha roots are outside this source interval.
+        const uvTop = 0.64, uvBottom = 0.43;
         const coreX = profile.width / 2 - profile.capWidth, coreZ = profile.depth / 2 - profile.capDepth;
         const positions = [], indices = [], uvs = [], normals = [], across = 24, down = 12;
         for (let row = 0; row <= down; row++) for (let x = 0; x <= across; x++) {
           const u = x / across, t = row / down;
-          const edgeInset = t * t * 0.006, localX = (u - 0.5) * width / STEP;
-          const cornerRatio = clamp((Math.abs(localX) - coreX) / (profile.capWidth - 0.010));
+          const edgeInset = t * t * 0.006, localX = (-leftExtent + u * (leftExtent + rightExtent)) / STEP;
+          const internalEdge = localX < 0 ? col > 0 : col < boardSize - 1;
+          const cornerRatio = internalEdge ? 0 : clamp((Math.abs(localX) - coreX) / (profile.capWidth - 0.010));
           const localZ = -coreZ - (profile.capDepth - 0.010) * Math.sqrt(1 - cornerRatio * cornerRatio);
-          const hem = grassHemOffset((boardSize - 1) * boardSize + col, localX, localZ) * (1 - t);
-          positions.push(centerX + localX * STEP * (1 - edgeInset), top + hem - t * height, block.position.z + localZ * STEP + edgeInset - 0.002);
+          const seed = (boardSize - 1) * boardSize + col;
+          const ownHem = grassHemOffset(seed, localX, localZ);
+          const worldX = centerX + localX * STEP;
+          const bottomRelief = 0.30 * (noise(worldX * 2.6, 17.3) - 0.5) + 0.04 * (noise(worldX * 7.3, 23.1) - 0.5);
+          const edgeWeight = clamp((Math.abs(u - 0.5) - 0.25) * 4);
+          const smoothWeight = edgeWeight * edgeWeight * (3 - 2 * edgeWeight);
+          const sharedHem = !internalEdge ? ownHem : localX < 0
+            ? (grassHemOffset(seed, -0.5, localZ) + grassHemOffset(seed - 1, 0.5, localZ)) / 2
+            : (grassHemOffset(seed, 0.5, localZ) + grassHemOffset(seed + 1, -0.5, localZ)) / 2;
+          const hem = (ownHem + (sharedHem - ownHem) * smoothWeight) * (1 - t);
+          const localHeight = height + ((u < 0.5 ? leftHeight : rightHeight) - height) * smoothWeight;
+          positions.push(worldX, top + hem - t * localHeight + t * t * bottomRelief, block.position.z + localZ * STEP + edgeInset - 0.002);
           // Each separate front belongs entirely to its own block, with preserved source detail.
-          const acrossIsland = (centerX + (u - 0.5) * width + textureBoardSpan / 2) / textureBoardSpan;
+          const acrossIsland = (worldX + textureBoardSpan / 2) / textureBoardSpan;
           uvs.push(0.025 + acrossIsland * 0.95, uvTop + (uvBottom - uvTop) * t);
         }
         for (let row = 0; row < down; row++) for (let x = 0; x < across; x++) {
@@ -544,79 +564,8 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
         Object.assign(data, { positions, indices, normals, uvs }); data.applyToMesh(face);
         face.material = frontMaterial; face.isPickable = false; face.receiveShadows = true; glow.addExcludedMesh(face); soilFill.includedOnlyMeshes.push(face);
       }
-      const contactSoil = frontMaterial.clone('shared-front-earth-contact');
-      const clonedFrontTexture = contactSoil.diffuseTexture;
-      contactSoil.diffuseTexture = earthFrontArt;
-      if (clonedFrontTexture !== earthFrontArt) clonedFrontTexture?.dispose();
-      contactSoil.diffuseColor.scaleInPlace(0.82); contactSoil.emissiveColor.set(0.025, 0.028, 0.014);
-      blendEarth(frontMaterial); blendEarth(contactSoil);
-      for (let col = 0; col < boardSize - 1; col++) {
-        const left = groundTiles[(boardSize - 1) * boardSize + col], right = groundTiles[(boardSize - 1) * boardSize + col + 1];
-        const centerX = (left.position.x + right.position.x) / 2, width = 0.19;
-        const top = left.metadata.nineSlice.grassBottom + 0.045;
-        const height = Math.max(left.metadata.nineSlice.bodyDepth, right.metadata.nineSlice.bodyDepth) * 0.80 + 0.025;
-        const positions = [], indices = [], uvs = [], normals = [], across = 4, down = 8;
-        for (let row = 0; row <= down; row++) for (let x = 0; x <= across; x++) {
-          const u = x / across, t = row / down, px = centerX + (u - 0.5) * width;
-          positions.push(px, top - t * height, -innerLimit - 0.004);
-          uvs.push(0.025 + (px + textureBoardSpan / 2) / textureBoardSpan * 0.95, 0.64 + (0.30 - 0.64) * t);
-        }
-        for (let row = 0; row < down; row++) for (let x = 0; x < across; x++) {
-          const a = row * (across + 1) + x, c = a + across + 1;
-          indices.push(a, c, a + 1, a + 1, c, c + 1);
-        }
-        VertexData.ComputeNormals(positions, indices, normals);
-        const joint = new Mesh(`recessed-front-earth-join-${col}`, scene), data = new VertexData();
-        Object.assign(data, { positions, indices, normals, uvs }); data.applyToMesh(joint);
-        joint.material = contactSoil; joint.isPickable = false; glow.addExcludedMesh(joint); soilFill.includedOnlyMeshes.push(joint);
-      }
+      blendEarth(frontMaterial);
     }
-    // Fine root fibers are merged and never take part in tile picking.
-    const rootPositions = [], rootIndices = [], rootUvs = [];
-    const rootMaterial = material('fine-hanging-roots', '#747047');
-    const appendRoot = (start, outward, length, thickness, seed) => {
-      const r = randomSource(seed), first = rootPositions.length / 3;
-      const bendX = (r() - 0.5) * 0.12, bendZ = (r() - 0.5) * 0.12;
-      for (let ring = 0; ring < 5; ring++) {
-        const t = ring / 4, radius = thickness * (1 - t * 0.88);
-        const x = start.x + outward.x * t * 0.045 + Math.sin(t * Math.PI) * bendX;
-        const z = start.z + outward.z * t * 0.045 + Math.sin(t * Math.PI) * bendZ;
-        for (let side = 0; side < 3; side++) {
-          const a = side / 3 * Math.PI * 2;
-          rootPositions.push(x + Math.cos(a) * radius, start.y - t * length, z + Math.sin(a) * radius);
-          rootUvs.push(side / 3, t);
-        }
-      }
-      for (let ring = 0; ring < 4; ring++) for (let side = 0; side < 3; side++) {
-        const a = first + ring * 3 + side, b = first + ring * 3 + (side + 1) % 3;
-        rootIndices.push(a, b + 3, b, a, a + 3, b + 3);
-      }
-    };
-    for (let i = 0; i < boardSize * boardSize; i++) {
-      const col = i % boardSize, row = Math.floor(i / boardSize), center = terrainCoord(i), directions = [];
-      if (col === 0) directions.push(new Vector3(-1, 0, 0));
-      if (col === boardSize - 1) directions.push(new Vector3(1, 0, 0));
-      if (row === 0) directions.push(new Vector3(0, 0, 1));
-      if (row === boardSize - 1 && !earthFrontArt) directions.push(new Vector3(0, 0, -1));
-      directions.forEach((outward, edge) => {
-        const r = randomSource(803 + i * 57 + edge * 29), tangent = new Vector3(outward.z, 0, -outward.x);
-        const fineRootCount = r() < 0.55 ? 0 : 1;
-        for (let j = 0; j < fineRootCount; j++) {
-          const start = center.add(outward.scale(STEP * 0.495 + 0.003 + r() * 0.006)).add(tangent.scale((r() - 0.5) * STEP * 0.85));
-          start.y = -0.32 - r() * 0.10;
-          const length = 0.10 + r() * 0.08;
-          appendRoot(start, outward, length, 0.004 + r() * 0.002, i * 83 + j * 17 + edge);
-        }
-      });
-    }
-    const terrainDetail = (name, positions, indices, uvs, mat) => {
-      if (!indices.length) return;
-      const mesh = new Mesh(name, scene), data = new VertexData(), normals = [];
-      VertexData.ComputeNormals(positions, indices, normals);
-      Object.assign(data, { positions, indices, normals, uvs }); data.applyToMesh(mesh);
-      mesh.convertToFlatShadedMesh(); mesh.material = mat; mesh.isPickable = false; mesh.receiveShadows = true; glow.addExcludedMesh(mesh); soilFill.includedOnlyMeshes.push(mesh);
-    };
-    terrainDetail('dangling-root-fibers', rootPositions, rootIndices, rootUvs, rootMaterial);
     const meshes = scene.meshes.filter((mesh) => !beforeMeshes.has(mesh));
     const materials = scene.materials.filter((mat) => !beforeMaterials.has(mat));
     meshes.forEach((mesh) => { mesh.parent = root; });
