@@ -1,6 +1,6 @@
 # Game texture sources
 
-The current painted terrain set and its exact generation prompts are documented in [STYLIZED-ASSETS-V6.md](STYLIZED-ASSETS-V6.md). Older textures below remain available as source artwork.
+The current painted terrain set and its exact generation prompts are documented in [GRASSY-FACE-ASSET.md](GRASSY-FACE-ASSET.md). Older textures below remain available as source artwork.
 
 Created for **빛이 있으라** with the built-in image generation tool on 2026-11-26. No third-party game art was copied. Original PNGs are included in this repository.
 

@@ -1,0 +1,11 @@
+# Grassy block face
+
+Current exposed front: `earth-front-grassy-v4.png`. Edited with the built-in image generation tool on 2026-11-26, from `earth-front-stylized-v3.png`. The upper face now carries short grass and moss instead of woody branching roots. The original generated image is retained at `C:/Users/admin/.codex/generated_images/01a2152d-3aa7-7620-9ec4-583f5c596a40/exec-3f143374-9fbd-4197-8a96-c2b0ed61515a.png`.
+
+Top grass and side soil are unchanged; see [STYLIZED-ASSETS-V6.md](STYLIZED-ASSETS-V6.md).
+
+The renderer uses the lower soil portion of this image beneath a continuous curved grass surface. The top grass texture follows the rounded nine-slice caps and turns down the block sides; a separate straight fringe strip is not used.
+
+## Exact prompt
+
+Edit this existing transparent game terrain strip. Preserve its exact broad horizontal layout, canvas proportions, approximate occupied bounding box and irregular lower earth silhouette. CHANGE THE MATERIAL TRANSITION: currently the top goes immediately into thick woody tree roots. Remove every thick woody branching root. Make the upper 40 percent of the occupied strip a lush compact living turf layer in muted olive-green and moss-green, with dense short fine grass blades, tiny soft moss cushions, and irregular wisps of grass draping gently down into the soil. This must look like GRASS, not a tree root system, not leafy ivy, not a hedge or green bricks. The grass is an organic continuation of a grassy block top; no hard horizontal wooden-looking ledge or dark brown header stripe. Show soft varied tufts and fine grassy fringe along the transition, some patches hang a little lower than others. Beneath the turf, retain the simple hand-painted gray-brown/taupe soil clods for the lower 60 percent, with only a few barely visible thin hairlike grass roots deeper down. No big exposed tree roots at all. Keep the miniature stylized painted game aesthetic, restrained olive colors, neutral warm light, clean readable forms at small display size. Keep transparency around the original silhouette and original margins. No perspective top plane, frame, text, props, flowers, tree branches, planks or decorative border. Main visual: thick grassy turf softly meeting earth, not grass immediately meeting wood.
