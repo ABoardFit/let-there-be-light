@@ -47,6 +47,7 @@ import '@babylonjs/core/Shaders/passCube.fragment.js';
 import '@babylonjs/core/Shaders/postprocess.vertex.js';
 
 const SIZE = 5;
+const TURF_HEIGHT = 0.245;
 const hex = (value) => Color3.FromHexString(value);
 const clamp = (x, low = 0, high = 1) => Math.max(low, Math.min(high, x));
 
@@ -149,58 +150,81 @@ function paintGround(ctx, size, variant, rock = false) {
   }
 }
 
-function beveledTile(scene, seed = 0, frontCutout = false) {
-  const mesh = new Mesh(`living-earth-tile-${seed}`, scene), r = randomSource(701 + seed * 47);
-  const positions = [0, 0.16, 0], indices = [], uvs = [0.5, 0.5], outline = [];
-  const half = 0.495;
-  const edgeSegments = 12, depthSegments = 12;
-  // Only the grass follows a shared grid. The soil below has no horizontal collar or ledge.
-  for (let edge = 0; edge < 4; edge++) for (let step = 0; step < edgeSegments; step++) {
-    const along = -half + step * half * 2 / edgeSegments, tiny = step ? (r() - 0.5) * 0.003 : 0;
-    const [x, z] = edge === 0 ? [along, -half + tiny] : edge === 1 ? [half + tiny, along]
-      : edge === 2 ? [-along, half + tiny] : [-half + tiny, -along];
-    outline.push([x, z, 0.157 + r() * 0.006]);
+// Geometry and source UV each preserve their end caps; only the central interval stretches.
+export function nineSliceAxis(value, halfExtent, capWidth, uvStart, uvEnd, uvCap) {
+  const low = -halfExtent, high = halfExtent;
+  if (value <= low + capWidth) return uvStart + (value - low) / capWidth * uvCap;
+  if (value >= high - capWidth) return uvEnd - (high - value) / capWidth * uvCap;
+  return uvStart + uvCap + (value - low - capWidth) / (2 * (halfExtent - capWidth)) * (uvEnd - uvStart - 2 * uvCap);
+}
+
+export function createNineSliceBlock(scene, seed = 0, frontArt = false, { width = 0.99, depth = 0.99, capWidth = 0.075, capDepth = capWidth } = {}) {
+  if (width <= capWidth * 2 || depth <= capDepth * 2 || Math.min(capWidth, capDepth) <= 0) throw new RangeError('Nine-slice caps must fit inside the block.');
+  const mesh = new Mesh('nine-slice-earth-block-' + seed, scene), r = randomSource(701 + seed * 47);
+  const uvRandom = randomSource(113 + seed * 61), uvTurn = Math.floor(uvRandom() * 4);
+  const uvSpan = 0.43, uvOffsetU = uvRandom() * (1 - uvSpan), uvOffsetV = uvRandom() * (1 - uvSpan), uvCap = 0.065;
+  const halfX = width / 2, halfZ = depth / 2, edgeHeight = TURF_HEIGHT - 0.10;
+  const axisX = [-halfX, -halfX + capWidth, halfX - capWidth, halfX];
+  const axisZ = [-halfZ, -halfZ + capDepth, halfZ - capDepth, halfZ];
+  const positions = [], indices = [], uvs = [];
+  for (let row = 0; row < 4; row++) for (let col = 0; col < 4; col++) {
+    const x = axisX[col], z = axisZ[row], isCapEdge = row === 0 || row === 3 || col === 0 || col === 3;
+    positions.push(x, isCapEdge ? edgeHeight : TURF_HEIGHT, z);
+    let u = nineSliceAxis(x, halfX, capWidth, 0, uvSpan, uvCap), v = nineSliceAxis(z, halfZ, capDepth, 0, uvSpan, uvCap);
+    [u, v] = uvTurn === 0 ? [u, v] : uvTurn === 1 ? [uvSpan - v, u] : uvTurn === 2 ? [uvSpan - u, uvSpan - v] : [v, uvSpan - u];
+    uvs.push(uvOffsetU + u, uvOffsetV + v);
   }
-  const n = outline.length;
-  outline.forEach(([x, z, y]) => {
-    positions.push(x, y, z);
-    const [u, v] = seed % 4 === 0 ? [x, z] : seed % 4 === 1 ? [-z, x] : seed % 4 === 2 ? [-x, -z] : [z, -x];
-    uvs.push(u + 0.5, v + 0.5);
-  });
-  for (let i = 0; i < n; i++) indices.push(0, i + 1, (i + 1) % n + 1);
+  const patches = [];
+  for (let row = 0; row < 3; row++) for (let col = 0; col < 3; col++) {
+    const a = row * 4 + col, b = a + 1, c = a + 4;
+    const kind = row === 1 && col === 1 ? 'center' : row !== 1 && col !== 1 ? 'corner' : 'edge';
+    patches.push({ row, col, kind, indexStart: indices.length, indexCount: 6 });
+    indices.push(a, b, c, b, c + 1, c);
+  }
   const topIndexCount = indices.length, sideStart = positions.length / 3;
-  const totalDepth = (0.78 + r() * 0.20) * (frontCutout ? 0.64 : 1);
-  const clumps = Array.from({ length: 4 }, () => Array.from({ length: 5 }, () => ({
-    u: 0.08 + r() * 0.84, v: 0.16 + r() * 0.70,
-    width: 0.10 + r() * 0.13, height: 0.13 + r() * 0.18,
-    amount: 0.045 + r() * 0.095,
-  })));
-  for (let ring = 0; ring <= depthSegments; ring++) {
-    const t = ring / depthSegments;
+  const outline = [0, 1, 2, 3, 7, 11, 15, 14, 13, 12, 8, 4];
+  const bodyDepth = 0.72 + r() * 0.14, solidDepth = frontArt ? bodyDepth * 0.60 : bodyDepth, rings = 4, n = outline.length;
+  for (let ring = 0; ring <= rings; ring++) {
+    const t = ring / rings;
     for (let j = 0; j <= n; j++) {
-      const [x, z, topY] = outline[j % n];
-      const side = Math.floor((j % n) / edgeSegments), u = (j % edgeSegments) / edgeSegments;
-      const edgeBlend = Math.sin(u * Math.PI) ** 0.45;
-      const lobes = clumps[side].reduce((sum, c) => sum + c.amount * Math.exp(-(((u - c.u) / c.width) ** 2) - ((t - c.v) / c.height) ** 2), 0) * edgeBlend;
-      const eroded = (noise(seed * 1.7 + j * 0.32, t * 6.4) - 0.5) * 0.055;
-      const swell = Math.sin(t * Math.PI * 0.8) * 0.065 + (lobes + eroded) * Math.sin(t * Math.PI / 2);
-      const scale = 1 + swell / half;
-      const unevenBase = (noise(seed + j * 0.28, 18.2) - 0.5) * 0.11;
-      positions.push(x * scale, topY - t * (totalDepth + unevenBase), z * scale);
-      uvs.push(j / edgeSegments, t);
+      const vertex = outline[j % n], x = positions[vertex * 3], z = positions[vertex * 3 + 2];
+      // Almost straight soil walls belong to each block; erosion stays within its footprint.
+      const inset = t * t * (0.008 + noise(seed * 2 + j, 7.1) * 0.014);
+      const wallDepth = solidDepth;
+      const bottomVariation = (noise(seed * 1.9 + j * 0.7, 11.3) - 0.5) * 0.065;
+      positions.push(x * (1 - inset), edgeHeight - t * (wallDepth + bottomVariation), z * (1 - inset));
+      uvs.push(j / 3, t);
     }
   }
-  for (let ring = 0; ring < depthSegments; ring++) for (let j = 0; j < n; j++) {
-    if (frontCutout && j < edgeSegments) continue;
+  for (let ring = 0; ring < rings; ring++) for (let j = 0; j < n; j++) {
     const a = sideStart + ring * (n + 1) + j, b = a + 1;
     indices.push(a, b + n + 1, b, a, a + n + 1, b + n + 1);
   }
+  // Close the underside of every individual earth block.
+  const bottomStart = sideStart + rings * (n + 1), bottomCenter = positions.length / 3;
+  positions.push(0, edgeHeight - solidDepth, 0); uvs.push(0.5, 0.5);
+  for (let j = 0; j < n; j++) indices.push(bottomCenter, bottomStart + j + 1, bottomStart + j);
   const normals = []; VertexData.ComputeNormals(positions, indices, normals);
-  const data = new VertexData(); Object.assign(data, { positions, indices, normals, uvs }); data.applyToMesh(mesh);
-  // Shared vertices keep the eroded face smooth; detailed clumps are part of the soil itself.
+  // Keep the center patch genuinely flat; the narrow descending caps retain their slope normals.
+  for (const vertex of [5, 6, 9, 10]) { normals[vertex * 3] = 0; normals[vertex * 3 + 1] = 1; normals[vertex * 3 + 2] = 0; }
+  const colors = new Array(positions.length / 3 * 4).fill(1);
+  for (let vertex = 0; vertex < sideStart; vertex++) {
+    const nx = normals[vertex * 3], ny = normals[vertex * 3 + 1], nz = normals[vertex * 3 + 2];
+    const horizontalNormal = Math.hypot(nx, nz);
+    const sunFacing = horizontalNormal > 0.001 ? clamp((-nx * 0.8 - nz * 0.55) / (horizontalNormal * Math.hypot(0.8, 0.55))) ** 1.3 : 0;
+    const row = Math.floor(vertex / 4), col = vertex % 4;
+    const outerCap = row === 0 || row === 3 || col === 0 || col === 3;
+    // Contact occlusion belongs to the sloping turf cap. Multiplying texture colour
+    // preserves this depth cue even when StandardMaterial clamps the direct light.
+    colors[vertex * 4] = outerCap ? 0.72 + sunFacing * 0.22 : 1;
+    colors[vertex * 4 + 1] = outerCap ? 0.72 + sunFacing * 0.14 : 1;
+    colors[vertex * 4 + 2] = outerCap ? 0.72 - sunFacing * 0.08 : 1;
+  }
+  const data = new VertexData(); Object.assign(data, { positions, indices, normals, uvs, colors }); data.applyToMesh(mesh);
   mesh.releaseSubMeshes();
   new SubMesh(0, 0, sideStart, 0, topIndexCount, mesh);
   new SubMesh(1, sideStart, positions.length / 3 - sideStart, topIndexCount, indices.length - topIndexCount, mesh);
+  mesh.metadata = { nineSlice: { width, depth, capWidth, capDepth, uvCap, edgeHeight, topVertexCount: 16, outline, patches, bodyDepth, solidDepth } };
   return mesh;
 }
 
@@ -235,19 +259,19 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
   scene.ambientColor = hex('#8b8295');
   scene.imageProcessingConfiguration.contrast = 1.06;
   scene.imageProcessingConfiguration.exposure = 1.0;
-  const camera = new ArcRotateCamera('battle-camera', -Math.PI / 2, 0.79, 12.6, new Vector3(0, 0.30, 0), scene);
+  const camera = new ArcRotateCamera('battle-camera', -Math.PI / 2, 0.94, 10.9, new Vector3(0, 0.30, 0), scene);
   camera.mode = Camera.PERSPECTIVE_CAMERA;
   camera.fov = 0.56; camera.minZ = 0.1; camera.maxZ = 80;
   const artUrl = (name) => `${import.meta.env.BASE_URL}textures/${name}`;
-  canvas.style.backgroundImage = `linear-gradient(rgba(27,24,39,.45),rgba(35,25,35,.56)), url("${artUrl('sunset-clouds.png')}")`;
+  canvas.style.backgroundImage = `linear-gradient(rgba(27,24,39,.12),rgba(35,25,35,.22)), url("${artUrl('sunset-clouds.png')}")`;
   canvas.style.backgroundSize = 'cover'; canvas.style.backgroundPosition = 'center';
   const ambient = new HemisphericLight('cloud-light', new Vector3(0, 1, 0), scene);
-  ambient.intensity = 0.65; ambient.diffuse = hex('#e1d6d0'); ambient.groundColor = hex('#4e455a');
-  const sun = new DirectionalLight('sunlight', new Vector3(-0.65, -1.4, -0.7), scene);
-  sun.position = new Vector3(7, 14, 6); sun.diffuse = hex('#ffe1b7'); sun.intensity = 1.1;
+  ambient.intensity = 0.57; ambient.diffuse = hex('#e2e1e5'); ambient.groundColor = hex('#4e455a');
+  const sun = new DirectionalLight('sunlight', new Vector3(0.8, -1.4, 0.55), scene);
+  sun.position = new Vector3(-8, 14, -5.5); sun.diffuse = hex('#ffe8c8'); sun.intensity = 1.12;
   sun.shadowMinZ = 0.1; sun.shadowMaxZ = 40;
-  const shadows = new ShadowGenerator(1024, sun);
-  shadows.usePercentageCloserFiltering = true; shadows.filteringQuality = ShadowGenerator.QUALITY_LOW;
+  const shadows = new ShadowGenerator(window.innerWidth > 760 ? 2048 : 1024, sun);
+  shadows.usePercentageCloserFiltering = true; shadows.filteringQuality = ShadowGenerator.QUALITY_MEDIUM;
   shadows.bias = 0.002; shadows.normalBias = 0.02; shadows.darkness = 0.25;
   const glow = new GlowLayer('battle-light', scene, { mainTextureFixedSize: 512, blurKernelSize: 32 });
   glow.intensity = 0.55;
@@ -263,21 +287,25 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
       () => { art.hasAlpha = alpha; art.anisotropicFilteringLevel = 8; resolve(art); },
       () => { art?.dispose(); resolve(null); });
   });
-  const [mossArt, cliffArt, heroArt, enemyArt, heroAttackArt, soilArt, earthFrontArt] = await Promise.all([
-    loadArt('moss-ground.png'), loadArt('rock-cliff.png'), loadArt('hero-knight.png', true), loadArt('shade-enemy.png', true), loadArt('hero-attack.png', true),
-    loadArt('dirt-soil.png'),
-    loadArt('earth-front.png', true),
+  const [mossArt, heroArt, enemyArt, heroAttackArt, soilArt, earthFrontArt] = await Promise.all([
+    loadArt('grass-stylized-v6.png'), loadArt('hero-knight.png', true), loadArt('shade-enemy.png', true), loadArt('hero-attack.png', true),
+    loadArt('soil-stylized-v2.png'),
+    loadArt('earth-front-stylized-v3.png', true),
   ]);
   const stone = material('worn-cut-stone', '#b9a58b');
-  stone.diffuseTexture = cliffArt || texture(scene, 'fallback-stone', 256, (ctx, size) => paintGround(ctx, size, 3, true));
+  stone.diffuseTexture = soilArt || texture(scene, 'fallback-stone', 256, (ctx, size) => paintGround(ctx, size, 3, true));
   const topsoil = material('continuous-natural-soil', '#e0d3c0'); topsoil.diffuseTexture = soilArt || stone.diffuseTexture;
-  topsoil.emissiveColor.set(0.25, 0.23, 0.21);
+  topsoil.emissiveColor.set(0.24, 0.23, 0.22);
   const soilFill = new DirectionalLight('front-soil-fill', new Vector3(0.15, -0.20, 1), scene);
   soilFill.diffuse = hex('#e8dfd1'); soilFill.specular.set(0, 0, 0); soilFill.intensity = 0.44;
-  const groundMaterials = Array.from({ length: 6 }, (_, i) => {
-    const m = material(`moss-block-${i}`, '#ffffff');
-    const tone = 0.80 + i * 0.022; m.diffuseColor.set(tone, tone, tone * 0.92);
+  // Keep diffuse below the shader's lighting clamp so the three turf tones remain distinct.
+  const grassTints = ['#74857f', '#7b8c86', '#819089', '#91947e', '#9d9d85', '#a3a18b', '#adb5b4', '#b1b8b8', '#b7bdbc'];
+  const groundMaterials = grassTints.map((tint, i) => {
+    const m = material(`moss-block-${i}`, tint);
+    m.specularColor.set(0, 0, 0);
     m.diffuseTexture = mossArt || texture(scene, `fallback-moss-${i}`, 256, (ctx, size) => paintGround(ctx, size, i));
+    const fills = [[0.014, 0.017, 0.012], [0.042, 0.036, 0.022], [0.095, 0.090, 0.068]];
+    m.emissiveColor.set(...fills[Math.floor(i / 3)]);
     const combined = new MultiMaterial(`ground-and-stone-${i}`, scene);
     combined.subMaterials = [m, topsoil]; return combined;
   });
@@ -292,7 +320,6 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
   contactMaterial.transparencyMode = StandardMaterial.MATERIAL_ALPHABLEND;
   const ringHero = material('hero-ground-light', '#d7bf72', '#7e7041');
   const ringEnemy = material('enemy-ground-light', '#cf7165', '#843d3a');
-  const rng = randomSource(481);
   const STEP = 1.16;
   const coord = (index) => new Vector3((index % SIZE - 2) * STEP, 0, (2 - Math.floor(index / SIZE)) * STEP);
   const screenUp = new Vector3(0, Math.sin(camera.beta), Math.cos(camera.beta));
@@ -301,29 +328,57 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
   // Flush grass surfaces sit on overlapping, independently eroded soil clumps.
   const groundTiles = [];
   for (let i = 0; i < SIZE * SIZE; i++) {
-    const tile = beveledTile(scene, i, Boolean(earthFrontArt) && Math.floor(i / SIZE) === SIZE - 1);
-    tile.material = groundMaterials[Math.floor(rng() * groundMaterials.length)];
+    const tile = createNineSliceBlock(scene, i, Boolean(earthFrontArt) && Math.floor(i / SIZE) === SIZE - 1);
+    tile.material = groundMaterials[(i * 7 + Math.floor(i / SIZE) * 2) % groundMaterials.length];
     tile.position = coord(i); tile.scaling.set(STEP, 1, STEP);
-    tile.receiveShadows = true; tile.metadata = { tileIndex: i }; groundTiles.push(tile); glow.addExcludedMesh(tile);
+    tile.receiveShadows = true; shadows.addShadowCaster(tile); tile.metadata = { ...tile.metadata, tileIndex: i }; groundTiles.push(tile); glow.addExcludedMesh(tile);
   }
   soilFill.includedOnlyMeshes = [...groundTiles];
+  // Small irregular turf fragments bridge texture grain and the larger tile colour fields.
+  const scatter = ['#bcb493', '#969b70', '#64704c'].map((color, i) => ({
+    positions: [], indices: [], mat: material(`turf-fragments-${i}`, color),
+  }));
+  for (let tileIndex = 0; tileIndex < SIZE * SIZE; tileIndex++) {
+    const r = randomSource(1701 + tileIndex * 83), center = coord(tileIndex);
+    const count = Math.floor(r() ** 1.3 * 31), clusters = Array.from({ length: 3 }, () => [(r() - 0.5) * 0.64, (r() - 0.5) * 0.64]);
+    for (let fragment = 0; fragment < count; fragment++) {
+      const group = r() < 0.17 ? 2 : r() < 0.55 ? 0 : 1, batch = scatter[group];
+      const cluster = clusters[Math.floor(r() * clusters.length)];
+      const x = center.x + clamp(cluster[0] + (r() - 0.5) * 0.23, -0.40, 0.40);
+      const z = center.z + clamp(cluster[1] + (r() - 0.5) * 0.23, -0.40, 0.40);
+      const radius = group === 2 ? 0.020 + r() * 0.018 : 0.010 + r() * 0.015;
+      const sides = 3 + Math.floor(r() * 3), first = batch.positions.length / 3, turn = r() * Math.PI * 2;
+      batch.positions.push(x, TURF_HEIGHT + 0.0025, z);
+      for (let point = 0; point < sides; point++) {
+        const angle = turn + point / sides * Math.PI * 2, size = radius * (0.65 + r() * 0.35);
+        batch.positions.push(x + Math.cos(angle) * size, TURF_HEIGHT + 0.001, z + Math.sin(angle) * size * (0.45 + r() * 0.45));
+      }
+      for (let point = 0; point < sides; point++) batch.indices.push(first, first + point + 1, first + (point + 1) % sides + 1);
+    }
+  }
+  scatter.forEach(({ positions, indices, mat }, i) => {
+    const mesh = new Mesh(`clustered-turf-fragments-${i}`, scene), data = new VertexData(), normals = [];
+    VertexData.ComputeNormals(positions, indices, normals); Object.assign(data, { positions, indices, normals }); data.applyToMesh(mesh);
+    mat.specularColor.set(0, 0, 0); mesh.material = mat; mesh.isPickable = false; glow.addExcludedMesh(mesh);
+  });
   if (earthFrontArt) {
-    const frontMaterial = material('exposed-earth-front-art', '#ffffff', '#d8d4cd');
+    const frontMaterial = material('exposed-earth-front-art', '#ffffff', '#e1ded7');
     frontMaterial.diffuseTexture = earthFrontArt; frontMaterial.useAlphaFromDiffuseTexture = true;
     frontMaterial.disableLighting = true; frontMaterial.transparencyMode = StandardMaterial.MATERIAL_ALPHATEST;
     frontMaterial.alphaCutOff = 0.48; frontMaterial.backFaceCulling = false;
     for (let col = 0; col < SIZE; col++) {
-      const r = randomSource(519 + col * 71), width = 1.30 + r() * 0.065, height = [0.95, 1.12, 0.92, 1.07, 0.98][col];
-      const centerX = (col - 2) * STEP, top = 0.157;
-      const uvStart = [0, 0.11, 0.04, 0.18, 0.05][col], uvSpan = [0.95, 0.80, 0.91, 0.76, 0.95][col];
-      const uvTop = 0.80 - (col % 3) * 0.015;
+      const block = groundTiles[20 + col], profile = block.metadata.nineSlice;
+      const width = profile.width * STEP, height = profile.bodyDepth + 0.045;
+      const centerX = block.position.x, top = profile.edgeHeight;
+      const uvTop = 0.655, uvBottom = 0.30;
       const positions = [], indices = [], uvs = [], normals = [], across = 14, down = 12;
       for (let row = 0; row <= down; row++) for (let x = 0; x <= across; x++) {
-        const u = x / across, t = row / down, depth = t;
-        const bulge = Math.sin(depth * Math.PI / 2) * (0.15 + col * 0.007) + Math.sin(u * Math.PI) * Math.sin(t * Math.PI) * 0.035;
-        positions.push(centerX + (u - 0.5) * width, top - t * height, -STEP * 2.5 - bulge - col * 0.002);
-        // Start below the source's grassy fringe: the top is soil, never a bright rim.
-        uvs.push(uvStart + (col % 2 ? 1 - u : u) * uvSpan, (1 - t) * uvTop);
+        const u = x / across, t = row / down;
+        const edgeInset = t * t * 0.006;
+        positions.push(centerX + (u - 0.5) * (width - edgeInset * 2), top - t * height, block.position.z - profile.depth * STEP / 2 - 0.003 + edgeInset);
+        // Each separate front belongs entirely to its own block, with preserved source detail.
+        const acrossIsland = (centerX + (u - 0.5) * width + STEP * 2.5) / (STEP * SIZE);
+        uvs.push(0.025 + acrossIsland * 0.95, uvTop + (uvBottom - uvTop) * t);
       }
       for (let row = 0; row < down; row++) for (let x = 0; x < across; x++) {
         const a = row * (across + 1) + x, b = a + 1, c = a + across + 1;
@@ -334,6 +389,34 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
       Object.assign(data, { positions, indices, normals, uvs }); data.applyToMesh(face);
       face.material = frontMaterial; face.isPickable = false; glow.addExcludedMesh(face);
     }
+  }
+  // Turf roots spill unevenly down only the exposed front face, joining grass to soil.
+  for (let col = 0; col < SIZE; col++) {
+    const tile = groundTiles[20 + col], sourceUvs = tile.getVerticesData('uv');
+    const positions = [], indices = [], uvs = [], normals = [], colors = [];
+    const mat = tile.material.subMaterials[0].clone(`front-turf-roots-${col}`);
+    mat.diffuseColor.set(0.42, 0.33, 0.24); mat.emissiveColor.set(0.025, 0.018, 0.012); mat.backFaceCulling = false;
+    mat.transparencyMode = StandardMaterial.MATERIAL_ALPHABLEND;
+    const profile = tile.metadata.nineSlice, segments = 12;
+    const height = profile.bodyDepth + 0.045, width = profile.width * STEP;
+    const frontDepth = (x, y) => {
+      const t = Math.max(0, (profile.edgeHeight - y) / height);
+      return tile.position.z - profile.depth * STEP / 2 - 0.005 + t * t * 0.006;
+    };
+    for (let j = 0; j <= segments; j++) {
+      const u = j / segments, x = tile.position.x + (u - 0.5) * width;
+      const y = profile.edgeHeight - 0.006;
+      const drop = 0.025 + noise(col * 7.2 + j * 0.67, 3.1) ** 0.7 * 0.105;
+      positions.push(x, y, frontDepth(x, y), x, y - drop, frontDepth(x, y - drop));
+      const sourceU = sourceUvs[0] * (1 - u) + sourceUvs[6] * u, sourceV = sourceUvs[1] * (1 - u) + sourceUvs[7] * u;
+      uvs.push(sourceU, sourceV, sourceU, sourceV - drop * 0.65);
+      colors.push(0.92, 0.85, 0.66, 0.82, 0.45, 0.32, 0.19, 0);
+      if (j < segments) { const a = j * 2; indices.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+    }
+    VertexData.ComputeNormals(positions, indices, normals);
+    const fringe = new Mesh(`hanging-turf-transition-${col}`, scene), data = new VertexData();
+    Object.assign(data, { positions, indices, normals, uvs, colors }); data.applyToMesh(fringe);
+    fringe.hasVertexAlpha = true; fringe.material = mat; fringe.isPickable = false; glow.addExcludedMesh(fringe);
   }
   // Fine hanging roots and embedded angular gravel break up the exposed soil silhouette.
   // They are one mesh per material, and never take part in tile picking.
@@ -383,7 +466,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     directions.forEach((outward, edge) => {
       const r = randomSource(803 + i * 57 + edge * 29), tangent = new Vector3(outward.z, 0, -outward.x);
       for (let j = 0; j < 3; j++) {
-        const start = center.add(outward.scale(STEP * 0.50 + 0.10 + r() * 0.075)).add(tangent.scale((r() - 0.5) * STEP * 0.85));
+        const start = center.add(outward.scale(STEP * 0.495 + 0.003 + r() * 0.006)).add(tangent.scale((r() - 0.5) * STEP * 0.85));
         start.y = -0.02 - r() * 0.28;
         const length = 0.40 + r() * 0.34;
         appendRoot(start, outward, length, 0.008 + r() * 0.009, i * 83 + j * 17 + edge);
@@ -391,7 +474,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
       }
       for (let j = 0; j < 4; j++) {
         if (r() > 0.55) continue;
-        const p = center.add(outward.scale(STEP * 0.5 + 0.11 + r() * 0.065)).add(tangent.scale((r() - 0.5) * STEP * 0.85));
+        const p = center.add(outward.scale(STEP * 0.495 + 0.008)).add(tangent.scale((r() - 0.5) * STEP * 0.85));
         p.y = -0.10 - r() * 0.57; appendGravel(p, outward, 0.028 + r() * 0.035, i * 111 + j * 37 + edge);
       }
     });
@@ -412,21 +495,41 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
   const targetMat = makeOverlayMaterial('valid-target-tiles', '#69a9d7', 0.13);
   const previewGoodMat = makeOverlayMaterial('attack-area-tiles', '#ebc46b', 0.36);
   const previewBadMat = makeOverlayMaterial('invalid-area-tiles', '#d6675d', 0.34);
+  const turfOverlay = (name, index, lift) => {
+    const tile = groundTiles[index], top = tile.subMeshes[0];
+    const positions = tile.getVerticesData('position').slice(0, top.verticesCount * 3);
+    for (let i = 1; i < positions.length; i += 3) positions[i] += lift;
+    const data = new VertexData();
+    data.positions = positions;
+    data.indices = tile.getIndices().slice(0, top.indexCount);
+    data.normals = tile.getVerticesData('normal').slice(0, top.verticesCount * 3);
+    const mesh = new Mesh(name, scene); data.applyToMesh(mesh);
+    mesh.position.copyFrom(coord(index)); mesh.scaling.copyFrom(tile.scaling);
+    mesh.isPickable = false; glow.addExcludedMesh(mesh); return mesh;
+  };
+  const turfOutline = (index, lift = 0.009) => {
+    const tile = groundTiles[index], positions = tile.getVerticesData('position'), points = [];
+    const outline = tile.metadata.nineSlice.outline;
+    // Use the 9-slice cap boundary, never the obsolete circular fan vertex ordering.
+    for (let i = 0; i <= outline.length; i++) {
+      const vertex = outline[i % outline.length];
+      points.push(new Vector3(positions[vertex * 3] * STEP, positions[vertex * 3 + 1] + lift, positions[vertex * 3 + 2] * STEP));
+    }
+    return points;
+  };
   const overlays = Array.from({ length: 25 }, (_, index) => {
-    const make = (name, mat, y) => {
-      const plane = CreatePlane(`${name}-${index}`, { width: 1.08, height: 1.08 }, scene);
-      const p = coord(index); plane.rotation.x = Math.PI / 2; plane.position.set(p.x, y, p.z);
+    const make = (name, mat, lift) => {
+      const plane = turfOverlay(`${name}-${index}`, index, lift);
       plane.material = mat; plane.isPickable = false; plane.setEnabled(false); glow.addExcludedMesh(plane); return plane;
     };
-    const p = coord(index), d = 0.53;
-    const border = CreateLines(`range-outline-${index}`, { points: [new Vector3(-d, 0.183, -d), new Vector3(d, 0.183, -d), new Vector3(d, 0.183, d), new Vector3(-d, 0.183, d), new Vector3(-d, 0.183, -d)] }, scene);
+    const p = coord(index);
+    const border = CreateLines(`range-outline-${index}`, { points: turfOutline(index) }, scene);
     border.position.copyFrom(p); border.color = hex('#9fc5de'); border.alpha = 0.6; border.isPickable = false; border.setEnabled(false);
-    const r = 0.50;
-    const dangerBorder = CreateLines(`danger-outline-${index}`, { points: [new Vector3(-r, 0.184, -r), new Vector3(r, 0.184, -r), new Vector3(r, 0.184, r), new Vector3(-r, 0.184, r), new Vector3(-r, 0.184, -r)] }, scene);
+    const dangerBorder = CreateLines(`danger-outline-${index}`, { points: turfOutline(index, 0.011) }, scene);
     dangerBorder.position.copyFrom(p); dangerBorder.color = hex('#ff9782'); dangerBorder.alpha = 1; dangerBorder.isPickable = false; dangerBorder.setEnabled(false);
-    return { telegraph: make('intent', telegraphMat, 0.170), target: make('target', targetMat, 0.173), preview: make('preview', previewGoodMat, 0.176), border, dangerBorder };
+    return { telegraph: make('intent', telegraphMat, 0.005), target: make('target', targetMat, 0.008), preview: make('preview', previewGoodMat, 0.011), border, dangerBorder };
   });
-  const focus = CreateLines('keyboard-pointer-focus', { points: [new Vector3(-0.54, 0.19, -0.54), new Vector3(0.54, 0.19, -0.54), new Vector3(0.54, 0.19, 0.54), new Vector3(-0.54, 0.19, 0.54), new Vector3(-0.54, 0.19, -0.54)] }, scene);
+  const focus = CreateLines('keyboard-pointer-focus', { points: turfOutline(0, 0.015) }, scene);
   focus.color = hex('#fff1c5'); focus.isPickable = false; focus.setEnabled(false);
   let hovered = null, keyboardFocus = null;
   const setFocus = (index) => {
@@ -484,12 +587,12 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     mat.alphaCutOff = 0.5; mat.backFaceCulling = false;
     const sprite = CreatePlane(`unit-${unit.id}`, { width: height * spriteAspect(tex), height }, scene);
     sprite.parent = root; sprite.material = mat; sprite.billboardMode = Mesh.BILLBOARDMODE_ALL;
-    sprite.position.copyFrom(screenUp.scale(height / 2).add(new Vector3(0, 0.16, 0)));
+    sprite.position.copyFrom(screenUp.scale(height / 2).add(new Vector3(0, TURF_HEIGHT, 0)));
     sprite.metadata = { tileIndex: unit.tile, actorId: unit.id }; shadows.addShadowCaster(sprite); glow.addExcludedMesh(sprite);
     const contact = CreatePlane(`unit-shadow-${unit.id}`, { width: 0.95, height: 0.70 }, scene);
-    contact.parent = root; contact.rotation.x = Math.PI / 2; contact.position.y = 0.168; contact.material = contactMaterial; contact.isPickable = false; glow.addExcludedMesh(contact);
+    contact.parent = root; contact.rotation.x = Math.PI / 2; contact.position.y = TURF_HEIGHT + 0.006; contact.material = contactMaterial; contact.isPickable = false; glow.addExcludedMesh(contact);
     const ring = CreateTorus(`unit-ring-${unit.id}`, { diameter: 0.88, thickness: 0.035, tessellation: 32 }, scene);
-    ring.parent = root; ring.position.y = 0.185; ring.material = isHero ? ringHero : ringEnemy; ring.isPickable = false;
+    ring.parent = root; ring.position.y = TURF_HEIGHT + 0.018; ring.material = isHero ? ringHero : ringEnemy; ring.isPickable = false;
     const label = document.createElement('div'); label.className = 'battle-unit-label';
     Object.assign(label.style, { position: 'absolute', width: '82px', transform: 'translate(-50%,-100%)', pointerEvents: 'none', textAlign: 'center', color: '#f7edda', font: '12px/1.3 "Malgun Gothic",sans-serif', filter: 'drop-shadow(0 2px 3px #17131bdd)' });
     label.setAttribute('aria-label', `${unit.name || (isHero ? '빛의 기사' : '그늘')} 체력`);
@@ -560,7 +663,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     const element = document.createElement('span'); element.textContent = text;
     Object.assign(element.style, { position: 'absolute', color, font: '700 24px/1 Georgia,"Malgun Gothic",serif', textShadow: '0 2px 2px #19151c,0 0 10px #19151c', transform: 'translate(-50%,-50%)', pointerEvents: 'none', zIndex: '3', whiteSpace: 'nowrap' });
     labelsRoot.append(element); labelElements.add(element);
-    const anchor = actor.root.position.add(screenUp.scale(actor.height * 0.8)).add(new Vector3(0, 0.2, 0));
+    const anchor = actor.root.position.add(screenUp.scale(actor.height * 0.8)).add(new Vector3(0, TURF_HEIGHT + 0.04, 0));
     void animate(650, (t) => {
       const point = projected(anchor); element.style.left = `${point.x}px`; element.style.top = `${point.y - (reducedMotion ? 0 : t * 30)}px`;
       element.style.opacity = String(1 - Math.max(0, t - 0.5) * 2);
@@ -579,15 +682,14 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
       actor.mat.diffuseTexture = heroAttackArt;
       const attackHeight = actor.height * 0.81;
       actor.sprite.scaling.set((direction.x < -0.05 ? -1 : 1) * spriteAspect(heroAttackArt) / spriteAspect(actor.baseTexture) * 0.81, 0.81, 1);
-      actor.sprite.position.copyFrom(screenUp.scale(attackHeight / 2).add(new Vector3(direction.x < -0.05 ? -0.20 : 0.20, 0.16, 0)));
+      actor.sprite.position.copyFrom(screenUp.scale(attackHeight / 2).add(new Vector3(direction.x < -0.05 ? -0.20 : 0.20, TURF_HEIGHT, 0)));
     }
     const effects = event.cardId === 'cross'
-      ? (event.tiles || [targetIndex]).map((i) => { const p = coord(i).add(new Vector3(0, 0.25, 0)); return beam(p.add(new Vector3(0, 2.1, 0)), p, '#d9c1ff', 0.055); })
+      ? (event.tiles || [targetIndex]).map((i) => { const p = coord(i).add(new Vector3(0, TURF_HEIGHT + 0.02, 0)); return beam(p.add(new Vector3(0, 2.1, 0)), p, '#d9c1ff', 0.055); })
       : [event.cardId === 'nova' ? energyArc(center, color, 1.18, Math.PI * 2)
         : useBeam ? beam(origin.add(new Vector3(0, 0.95, 0)), center, color) : energyArc(center, color)];
     const pulses = (event.tiles || [targetIndex]).filter((i) => Number.isInteger(i) && i >= 0 && i < 25).map((i) => {
-      const pulse = CreatePlane('struck-ground', { width: 1.04, height: 1.04 }, scene);
-      pulse.rotation.x = Math.PI / 2; pulse.position.copyFrom(coord(i)); pulse.position.y = 0.181;
+      const pulse = turfOverlay('struck-ground', i, 0.014);
       pulse.material = effectMaterial('impact-floor', color, 0.4); pulse.isPickable = false; effectMeshes.add(pulse); return pulse;
     });
     await animate(420, (t) => {
@@ -676,7 +778,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     camera.viewport.y = (bottom + soilClearance) / height; camera.viewport.height = usable / height;
     // Long focal length keeps the rear row a little narrower, without diamond rotation.
     const aspect = width / usable;
-    camera.radius = Math.max(12.3, 1.9 + 6.65 / (2 * Math.tan(camera.fov / 2) * aspect));
+    camera.radius = Math.max(mobile ? 12.3 : 10.9, 1.9 + 6.65 / (2 * Math.tan(camera.fov / 2) * aspect));
     actors.forEach((actor) => { actor.label.style.width = mobile ? '72px' : '82px'; });
   };
   const observer = new ResizeObserver(resize); observer.observe(canvas);
@@ -693,7 +795,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     const visibleActors = [...actors.values()].filter((actor) => {
       if (!actor.root.isEnabled() || actor.label.hidden) { actor.leader.hidden = true; return false; }
       return true;
-    }).map((actor) => ({ actor, p: projected(actor.root.position.add(screenUp.scale(actor.height + 0.09)).add(new Vector3(0, 0.16, 0))) }))
+    }).map((actor) => ({ actor, p: projected(actor.root.position.add(screenUp.scale(actor.height + 0.09)).add(new Vector3(0, TURF_HEIGHT, 0))) }))
       .sort((a, b) => a.p.y - b.p.y);
     visibleActors.forEach(({ actor, p }) => {
       if (p.z < 0 || p.z > 1) { actor.label.style.display = 'none'; actor.leader.hidden = true; return; }
