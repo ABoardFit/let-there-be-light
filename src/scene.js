@@ -63,6 +63,62 @@ function randomSource(seed) {
   };
 }
 
+// Tile-local failure directions keep the same collapse when the board rotates.
+// Select by material volume, not fragment order, so differently sized shards
+// leave a recognisable supporting core instead of always dropping one side.
+export function createCollapseMotion(tileIndex, fragments) {
+  const random = randomSource(13007 + tileIndex * 8191);
+  const angle = random() * Math.PI * 2;
+  const direction = new Vector3(Math.cos(angle), 0, Math.sin(angle));
+  const cross = new Vector3(-direction.z, 0, direction.x);
+  const totalVolume = fragments.reduce((sum, fragment) => sum + fragment.volume, 0);
+  const totalTopArea = fragments.reduce((sum, fragment) => sum + fragment.topArea, 0);
+  const anchor = fragments.reduce((best, fragment, index) => {
+    const score = fragment.topArea / (1 + Math.hypot(fragment.center.x, fragment.center.z) * 4);
+    return score > best.score ? { index, score } : best;
+  }, { index: 0, score: -1 }).index;
+  const ranked = fragments.map((fragment, index) => ({ index,
+    score: Vector3.Dot(fragment.center, direction) - fragment.center.y * .32 + random() * .19,
+  })).filter(({ index }) => index !== anchor).sort((a, b) => b.score - a.score);
+  const hasBuriedPiece = ranked.some(({ index }) => fragments[index].topArea < 1e-6);
+  let bestMask = 0, bestDistance = Infinity;
+  // There are only 8–12 shards. A small subset search preserves a load-bearing
+  // core while ensuring both the grassy roof and underlying stone actually fail.
+  for (let mask = 1; mask < 2 ** ranked.length; mask++) {
+    let volume = 0, topArea = 0, preference = 0, count = 0, buried = false;
+    ranked.forEach(({ index, score }, bit) => {
+      if (!(mask & (1 << bit))) return;
+      const fragment = fragments[index];
+      volume += fragment.volume; topArea += fragment.topArea; preference += score; count++;
+      buried ||= fragment.topArea < 1e-6;
+    });
+    const ratio = volume / totalVolume, topRatio = topArea / totalTopArea;
+    const distance = Math.abs(ratio - .45) * 2 + Math.abs(topRatio - .38) * .55 - preference / count * .25
+      + (ratio < .35 || ratio > .55 ? 100 : 0) + (topRatio < .18 ? 10 : 0) + (hasBuriedPiece && !buried ? 5 : 0);
+    if (distance < bestDistance) { bestDistance = distance; bestMask = mask; }
+  }
+  const affected = new Set(ranked.filter((_, bit) => bestMask & (1 << bit)).map(({ index }) => index));
+  return fragments.map((fragment, index) => {
+    const r = randomSource(fragment.seed ^ Math.imul(tileIndex + 1, 7919));
+    const failed = affected.has(index), core = index === anchor;
+    const radial = new Vector3(fragment.center.x, 0, fragment.center.z);
+    if (radial.lengthSquared() > .0001) radial.normalize();
+    else radial.copyFrom(direction);
+    const side = r() * 2 - 1;
+    const settle = direction.scale(failed ? .025 + r() * .055 : .003 + r() * .008)
+      .add(cross.scale(side * (failed ? .055 : .008))).add(radial.scale(failed ? .035 : .008));
+    settle.y = failed ? -(.30 + r() * .43) : core ? -.008 : -(.018 + r() * .048);
+    const tilt = new Vector3(
+      (direction.z + side * .50) * (failed ? .18 + r() * .22 : core ? .008 : .035),
+      (r() - .5) * (failed ? .35 : .045),
+      (-direction.x + side * .45) * (failed ? .18 + r() * .22 : core ? .008 : .035));
+    const fallDrift = radial.scale(.13 + r() * .16).add(direction.scale(.04 + r() * .06));
+    const fallSpin = new Vector3((r() - .5) * 2.8, (r() - .5) * 1.8, (r() - .5) * 2.8);
+    return { affected: failed, settle, tilt, lag: failed ? r() * .18 : .03 + r() * .10,
+      fallLag: r() * .20, fallDistance: 3.15 + r() * .65, fallDrift, fallSpin };
+  });
+}
+
 function noise(x, y) {
   const hash = (a, b) => {
     let n = Math.imul(a, 374761393) + Math.imul(b, 668265263);
@@ -321,6 +377,20 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     const combined = new MultiMaterial(`ground-and-stone-${i}`, scene);
     combined.subMaterials = [m, topsoil]; return combined;
   });
+  // The newly exposed interior has its own square, isotropic soil mapping.
+  // Reusing the outside's narrow cliff UVs stretched stones and painted moss
+  // across the cuts. Original turf/stone materials remain shared and unchanged.
+  const interiorStone = material('fracture-interior-stone', '#b8b3a2');
+  interiorStone.diffuseTexture = soilArt || topsoil.diffuseTexture;
+  interiorStone.useAlphaFromDiffuseTexture = false;
+  interiorStone.transparencyMode = StandardMaterial.MATERIAL_OPAQUE;
+  interiorStone.specularColor.set(0, 0, 0);
+  interiorStone.emissiveColor.set(0.035, 0.030, 0.025);
+  const fractureMaterials = new Map(groundMaterials.map((original, index) => {
+    const combined = new MultiMaterial(`fracture-and-interior-${index}`, scene);
+    combined.subMaterials = [...original.subMaterials, interiorStone];
+    return [original, combined];
+  }));
   const contactMaterial = material('contact-shadow', '#211f21', '#211f21');
   contactMaterial.disableLighting = true; contactMaterial.alpha = 0.6;
   contactMaterial.diffuseTexture = texture(scene, 'contact-falloff', 64, (ctx, w, h) => {
@@ -712,8 +782,14 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   const getDamage = (terrain, index) => {
     if (terrain.damage[index]) return terrain.damage[index];
     const damage = fractureBlock(terrain.groundTiles[index]);
+    damage.motion = createCollapseMotion(index, damage.fragments);
     damage.crack.material = crackMaterial; glow.addExcludedMesh(damage.crack);
-    damage.fragments.forEach(({ mesh }) => { shadows.addShadowCaster(mesh); glow.addExcludedMesh(mesh); soilFill.includedOnlyMeshes.push(mesh); });
+    damage.fragments.forEach(({ mesh, volume, topArea, seed }, part) => {
+      mesh.material = fractureMaterials.get(terrain.groundTiles[index].material);
+      mesh.metadata.collapseMotion = damage.motion[part];
+      Object.assign(mesh.metadata, { fragmentVolume: volume, fragmentTopArea: topArea, fragmentSeed: seed });
+      shadows.addShadowCaster(mesh); glow.addExcludedMesh(mesh); soilFill.includedOnlyMeshes.push(mesh);
+    });
     const dispose = damage.dispose;
     let damageDisposed = false;
     damage.dispose = () => {
@@ -752,23 +828,24 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
         tile.setEnabled(false); damage.crack.setEnabled(false);
         terrain.details.filter((mesh) => mesh.parent === terrain.tileRoots[index]).forEach((mesh) => mesh.setEnabled(false));
         damage.fragments.forEach(({ root }) => root.setEnabled(true));
-        await animate(650, (t) => {
-          const progress = ease(t);
-          damage.fragments.forEach(({ root, base, part }) => {
-            if (part !== 1 && part !== 3) return;
-            root.position.copyFrom(base).addInPlace(new Vector3(.14 * progress, -.62 * progress, (part === 1 ? -.08 : .08) * progress));
-            root.rotation.set((part === 1 ? -.15 : .17) * progress, .08 * progress, -.30 * progress);
+        await animate(850, (t) => {
+          damage.fragments.forEach(({ root, base }, part) => {
+            const motion = damage.motion[part];
+            const progress = ease(clamp((t - motion.lag) / (1 - motion.lag)));
+            root.position.copyFrom(base).addInPlace(motion.settle.scale(progress));
+            root.rotation.copyFrom(motion.tilt).scaleInPlace(progress);
           });
         });
       } else {
         damage.crack.setEnabled(false); sync(latestState); setFocus(null);
         const starts = damage.fragments.map(({ root }) => ({ position: root.position.clone(), rotation: root.rotation.clone() }));
-        await animate(1000, (t) => {
-          damage.fragments.forEach(({ root, mesh, part }, i) => {
-            const start = starts[i], side = part === 0 || part === 2 ? -1 : part === 4 ? 0 : 1;
-            const fall = Math.max(0, (t - part * .025) / (1 - part * .025));
-            root.position.copyFrom(start.position).addInPlace(new Vector3(side * .38 * fall, .10 * Math.sin(Math.PI * fall) - 3.6 * fall * fall, (part % 2 ? -.22 : .22) * fall));
-            root.rotation.copyFrom(start.rotation).addInPlace(new Vector3((part % 2 ? .8 : -.7) * fall, .45 * fall, side * .8 * fall));
+        await animate(1150, (t) => {
+          damage.fragments.forEach(({ root, mesh }, i) => {
+            const start = starts[i], motion = damage.motion[i];
+            const fall = clamp((t - motion.fallLag) / (1 - motion.fallLag));
+            root.position.copyFrom(start.position).addInPlace(motion.fallDrift.scale(fall));
+            root.position.y -= .18 * fall + motion.fallDistance * fall * fall;
+            root.rotation.copyFrom(start.rotation).addInPlace(motion.fallSpin.scale(fall));
             mesh.visibility = 1 - clamp((fall - .15) / .70);
           });
         });
