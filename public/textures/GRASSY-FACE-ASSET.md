@@ -6,9 +6,9 @@ Top grass and side soil are unchanged; see [STYLIZED-ASSETS-V6.md](STYLIZED-ASSE
 
 The renderer uses the lower soil portion of this image beneath a continuous curved grass surface. The top grass texture follows the rounded nine-slice caps and turns down the block sides; a separate straight fringe strip is not used.
 
-The current renderer preserves the existing stone artwork. An irregular grass hem and shared world-space colour blend join the curved grass to the stone region without reintroducing the image's separate painted grass header. No new raster image was needed for this correction. The same terrain geometry and materials are used in the 1×1 through 5×5 comparison views.
+The current renderer preserves the existing stone artwork with a single, non-repeating UV mapping across the exposed front. The world-space colour blend is limited to the grass contact; it fades out before the main stone body so the original clods, cracks and small pebbles remain visible once. Mirrored stone sampling is not used. No new raster image was needed for this correction. The same terrain geometry and materials are used in the 1×1 through 5×5 comparison views.
 
-The narrower rounded caps now meet as close-set tile seams. Adjacent exposed fronts share their boundary rather than using a separate connector panel. The lower outline uses shallow, broad erosion in the geometry and excludes the source image's thin dangling root silhouettes; procedural hanging roots are also removed. The irregular grass hem remains intact.
+The narrower rounded caps now meet as close-set tile seams. Adjacent exposed fronts share their boundary rather than using a separate connector panel. A lower-edge alpha filter removes thin dangling root silhouettes while retaining the broad stone shapes and their original colour; procedural hanging roots are also removed. The irregular grass hem remains intact.
 
 ## Exact prompt
 

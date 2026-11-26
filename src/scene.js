@@ -89,9 +89,10 @@ function grassHemOffset(seed, x, z) {
 // StandardMaterial's hook runs after lighting/alpha test and before image processing.
 // Both sides of the mesh join therefore resolve to exactly the same world-space colour.
 class SharedEarthBlend extends MaterialPluginBase {
-  constructor(material, earthTexture) {
+  constructor(material, earthTexture, trimFineRoots = false) {
     super(material, 'SharedEarthBlend', 190, {}, true, true);
     this.earthTexture = earthTexture;
+    this.trimFineRoots = trimFineRoots;
     this.doNotSerialize = true;
   }
   getClassName() { return 'SharedEarthBlend'; }
@@ -115,18 +116,26 @@ class SharedEarthBlend extends MaterialPluginBase {
           return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
         }
       `,
+      CUSTOM_FRAGMENT_BEFORE_LIGHTS: this.trimFineRoots ? `
+        // Keep broad original stone silhouettes, suppress only thin hanging alpha roots.
+        if (vDiffuseUV.y < 0.45) {
+          float leftCoverage = texture2D(diffuseSampler, vDiffuseUV + vec2(-0.006, 0.0)).a;
+          float rightCoverage = texture2D(diffuseSampler, vDiffuseUV + vec2(0.006, 0.0)).a;
+          if (min(leftCoverage, rightCoverage) < 0.48) discard;
+        }
+      ` : '',
       CUSTOM_FRAGMENT_BEFORE_FOG: `
         float terrainNoise = terrainBlendNoise(vPositionW.xz * 8.0);
         float terrainMix = 1.0 - smoothstep(-0.005, 0.16 + (terrainNoise - 0.5) * 0.10, vPositionW.y);
+        // The shared colour only bridges the material seam. Below it, retain the
+        // original single-coverage artwork and its unique stone arrangement.
+        terrainMix *= smoothstep(-0.22, -0.08, vPositionW.y);
         if (terrainMix > 0.001) {
           float terrainFingers = (terrainBlendNoise(vec2(vPositionW.x * 4.5, 11.0)) - 0.5) * 0.12;
           float terrainY = vPositionW.y + terrainFingers;
           // Sample only the original stone, excluding the painted grass header.
           // World-space phase stays identical on both sides of the grass/earth join.
-          // Match vertical texel density to the horizontal projection. Mirror only
-          // opaque stone rows, so neither the painted grass header nor alpha roots repeat.
-          float terrainPhase = (terrainY * 0.45 + 0.029) / 0.14;
-          float terrainV = 0.43 + 0.07 * (1.0 - abs(fract(terrainPhase) * 2.0 - 1.0));
+          float terrainV = clamp(0.49 + (terrainY + 0.045) * 0.20, 0.43, 0.525);
           vec2 terrainUV = vec2(
             clamp(0.025 + (vPositionW.x + 2.9) / 5.8 * 0.95, 0.04, 0.96),
             terrainV
@@ -415,7 +424,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     loadArt('soil-stylized-v2.png'),
     loadArt('earth-front-grassy-v4.png', true),
   ]);
-  const blendEarth = (mat) => { if (earthFrontArt) new SharedEarthBlend(mat, earthFrontArt); };
+  const blendEarth = (mat, trimFineRoots = false) => { if (earthFrontArt) new SharedEarthBlend(mat, earthFrontArt, trimFineRoots); };
   const stone = material('worn-cut-stone', '#b9a58b');
   stone.diffuseTexture = soilArt || texture(scene, 'fallback-stone', 256, (ctx, size) => paintGround(ctx, size, 3, true));
   const topsoil = material('continuous-natural-soil', '#e0d3c0'); topsoil.diffuseTexture = soilArt || stone.diffuseTexture;
@@ -528,9 +537,8 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
         const rightExtent = col < boardSize - 1 ? STEP / 2 : width / 2;
         const leftHeight = col > 0 ? (height + groundTiles[(boardSize - 1) * boardSize + col - 1].metadata.nineSlice.bodyDepth * 0.80) / 2 : height;
         const rightHeight = col < boardSize - 1 ? (height + groundTiles[(boardSize - 1) * boardSize + col + 1].metadata.nineSlice.bodyDepth * 0.80) / 2 : height;
-        // Keep the original stone colour, but finish on a broad eroded geometry profile.
-        // The image's thin dangling alpha roots are outside this source interval.
-        const uvTop = 0.64, uvBottom = 0.43;
+        // Show the original stones once, preserving their order and landmarks.
+        const uvTop = 0.53, uvBottom = 0.32;
         const coreX = profile.width / 2 - profile.capWidth, coreZ = profile.depth / 2 - profile.capDepth;
         const positions = [], indices = [], uvs = [], normals = [], across = 24, down = 12;
         for (let row = 0; row <= down; row++) for (let x = 0; x <= across; x++) {
@@ -546,8 +554,8 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
           const edgeWeight = clamp((Math.abs(u - 0.5) - 0.25) * 4);
           const smoothWeight = edgeWeight * edgeWeight * (3 - 2 * edgeWeight);
           const sharedHem = !internalEdge ? ownHem : localX < 0
-            ? (grassHemOffset(seed, -0.5, localZ) + grassHemOffset(seed - 1, 0.5, localZ)) / 2
-            : (grassHemOffset(seed, 0.5, localZ) + grassHemOffset(seed + 1, -0.5, localZ)) / 2;
+            ? Math.max(grassHemOffset(seed, -0.5, localZ), grassHemOffset(seed - 1, 0.5, localZ)) + 0.085
+            : Math.max(grassHemOffset(seed, 0.5, localZ), grassHemOffset(seed + 1, -0.5, localZ)) + 0.085;
           const hem = (ownHem + (sharedHem - ownHem) * smoothWeight) * (1 - t);
           const localHeight = height + ((u < 0.5 ? leftHeight : rightHeight) - height) * smoothWeight;
           positions.push(worldX, top + hem - t * localHeight + t * t * bottomRelief, block.position.z + localZ * STEP + edgeInset - 0.002);
@@ -564,7 +572,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
         Object.assign(data, { positions, indices, normals, uvs }); data.applyToMesh(face);
         face.material = frontMaterial; face.isPickable = false; face.receiveShadows = true; glow.addExcludedMesh(face); soilFill.includedOnlyMeshes.push(face);
       }
-      blendEarth(frontMaterial);
+      blendEarth(frontMaterial, true);
     }
     const meshes = scene.meshes.filter((mesh) => !beforeMeshes.has(mesh));
     const materials = scene.materials.filter((mat) => !beforeMaterials.has(mat));
