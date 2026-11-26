@@ -19,21 +19,24 @@
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
 
 /* Terrain previews share the battle scene without exposing combat controls. */
-.board-layout-controls{position:absolute;z-index:6;top:max(18px,env(safe-area-inset-top));right:max(24px,env(safe-area-inset-right));max-width:calc(100% - 24px);color:#fff0d4}
+.board-layout-controls{position:absolute;z-index:6;top:max(18px,env(safe-area-inset-top));right:max(24px,env(safe-area-inset-right));width:310px;max-width:calc(100% - 24px);color:#fff0d4}
 .board-layout-buttons{display:flex;align-items:center;gap:4px;padding:4px;border:1px solid #e3c39059;border-radius:9px;background:#342d38e8;box-shadow:0 3px 12px #201b2c26}
 .board-layout-buttons button{min-width:42px;min-height:40px;padding:7px 8px;border:1px solid transparent;border-radius:5px;background:transparent;color:#e8d7c2;font-size:12px;line-height:1.25;white-space:nowrap;font-variant-numeric:tabular-nums}
 .board-layout-buttons button:hover:not(:disabled){background:#eed29c20;color:#fff4dc}
 .board-layout-buttons button[aria-pressed=true]{background:#d9b579;border-color:#f1d49e;color:#302820}
 .board-layout-buttons button:disabled{opacity:.45}
 .board-layout-buttons #return-to-battle{min-width:58px;margin-left:3px}
-#board-preview-status{margin-top:7px;text-align:right;font-size:12px;color:#fff0d4;text-shadow:0 1px 7px #33283e}
+.board-view-buttons{margin-top:4px}
+.board-view-buttons button{flex:1;min-width:0;padding:7px 4px;min-height:34px}
+#board-view-status{margin-top:6px;text-align:right;font-size:12px;line-height:1.5;color:#fff0d4;text-shadow:0 1px 7px #33283e}
 .battle-header .turn-banner{top:0}
-.battle-header .header-actions{margin-top:51px}
+.battle-header .header-actions{margin-top:128px}
 .board-preview .battle-header,.board-preview .battle-log,.board-preview .target-prompt,.board-preview .battle-dock,.board-preview #unit-labels,.board-preview #toast,.board-preview #keyboard-help{display:none}
 .board-preview .scene-shade{background:linear-gradient(180deg,#32263428,transparent 24%)}
-@media(max-width:1100px){.battle-header{top:80px}.battle-header .header-actions{margin-top:0}}
-@media(max-width:760px){.board-layout-controls{top:max(12px,env(safe-area-inset-top));right:max(12px,env(safe-area-inset-right))}.board-layout-buttons button{min-height:40px}.battle-header{top:76px}.toast{top:123px}}
+@media(max-width:1100px){.battle-header{top:146px}.battle-header .header-actions{margin-top:0}.toast{top:196px}}
+@media(max-width:760px){.board-layout-controls{top:max(12px,env(safe-area-inset-top));right:max(12px,env(safe-area-inset-right))}.battle-header{top:140px}.toast{top:190px}}
 @media(max-width:360px){.board-layout-buttons{gap:2px}.board-layout-buttons button{min-width:38px;padding:7px 5px}.board-layout-buttons #return-to-battle{min-width:52px;margin-left:1px}}
+@media(max-height:480px) and (min-width:600px){.board-layout-controls{top:10px;right:14px}.battle-header{top:17px;left:18px;right:340px}.battle-header .turn-banner{left:0;transform:none}.battle-header .header-actions{position:absolute;left:0;top:51px;margin:0}.toast{top:100px;left:18px;transform:none;max-width:calc(100vw - 365px)}}
 
 /* Keep card frames inside the viewport. */
 @media(min-width:761px) and (min-height:701px){.battle-dock{padding-bottom:31px}}

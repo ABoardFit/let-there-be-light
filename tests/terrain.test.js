@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
 import { Scene } from '@babylonjs/core/scene.js';
 import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
-import { createNineSliceBlock } from '../src/scene.js';
+import { createNineSliceBlock } from '../src/terrain.js';
 
 test('resizing a nine-slice block preserves world-space caps and source UVs', () => {
   const engine = new NullEngine();
@@ -88,4 +88,134 @@ test('grass is one connected surface with open edges only along its irregular bo
     scene.dispose();
     engine.dispose();
   }
+});
+
+test('every block is a closed oriented solid, including the grass join and underside', () => {
+  const engine = new NullEngine(), scene = new Scene(engine);
+  try {
+    for (let seed = 0; seed < 25; seed++) {
+      const mesh = createNineSliceBlock(scene, seed, false), p = mesh.getVerticesData('position'), indices = mesh.getIndices();
+      assert.ok([...p, ...mesh.getVerticesData('normal'), ...mesh.getVerticesData('uv')].every(Number.isFinite), 'every rendered coordinate, normal and UV must be finite');
+      const keys = Array.from({length: p.length / 3}, (_, i) => p.slice(i * 3, i * 3 + 3).map(v => v.toFixed(7)).join(','));
+      const edges = new Map();
+      for (let i = 0; i < indices.length; i += 3) {
+        const ids = indices.slice(i, i + 3), a = Vector3.FromArray(p, ids[0] * 3), b = Vector3.FromArray(p, ids[1] * 3), c = Vector3.FromArray(p, ids[2] * 3);
+        assert.ok(Vector3.Cross(b.subtract(a), c.subtract(a)).lengthSquared() > 1e-17, 'no collapsed triangles');
+        for (let j = 0; j < 3; j++) {
+          const from = keys[ids[j]], to = keys[ids[(j + 1) % 3]], key = [from, to].sort().join('|');
+          const edge = edges.get(key) || {count: 0, orientation: 0};
+          edge.count++; edge.orientation += from < to ? 1 : -1; edges.set(key, edge);
+        }
+      }
+      for (const edge of edges.values()) {
+        assert.equal(edge.count, 2, 'every spatial edge must be shared by exactly two faces');
+        assert.equal(edge.orientation, 0, 'adjacent faces must have consistent winding');
+      }
+      const body = mesh.metadata.nineSlice;
+      const other = createNineSliceBlock(scene, seed, true);
+      assert.deepEqual(mesh.getVerticesData('position'), other.getVerticesData('position'), 'front-row flags cannot truncate or recess any block');
+      other.dispose();
+      assert.ok(body.bottomIds.length > 32, 'the lower silhouette is resolved by geometry');
+      for (let j = 0; j < body.stoneRings[0].length; j++) {
+        for (let r = 1; r < body.stoneRings.length; r++) {
+          assert.ok(p[body.stoneRings[r][j] * 3 + 1] < p[body.stoneRings[r - 1][j] * 3 + 1], 'stone columns must descend without vertical folds');
+        }
+      }
+      // Measure actual silhouette peaks, independently of the contour generator.
+      // A steep broad clod is valid; a deep, narrow downward tip is not.
+      const ring = body.stoneRings.at(-1).slice(0, -1), n = ring.length;
+      const heights = ring.map(id => p[id * 3 + 1]);
+      const distance = (a, b) => Math.hypot(p[ring[a] * 3] - p[ring[b] * 3], p[ring[a] * 3 + 2] - p[ring[b] * 3 + 2]);
+      for (let j = 0; j < n; j++) {
+        if (!(heights[j] < heights[(j + n - 1) % n] && heights[j] <= heights[(j + 1) % n])) continue;
+        const adjacentPeak = direction => {
+          let current = j;
+          for (let step = 0; step < n; step++) {
+            const next = (current + direction + n) % n;
+            if (heights[next] < heights[current]) return heights[current];
+            current = next;
+          }
+          return heights[current];
+        };
+        const prominence = Math.min(adjacentPeak(-1), adjacentPeak(1)) - heights[j];
+        if (prominence < 0.03) continue;
+        const halfway = heights[j] + prominence / 2;
+        const halfWidth = direction => {
+          let current = j, width = 0;
+          for (let step = 0; step < n; step++) {
+            const next = (current + direction + n) % n, length = distance(current, next);
+            if (heights[next] >= halfway) return width + length * (halfway - heights[current]) / (heights[next] - heights[current]);
+            width += length; current = next;
+          }
+          return width;
+        };
+        assert.ok(halfWidth(-1) + halfWidth(1) > 0.04, `block ${seed}: a downward lobe at least 3 cm deep must span over 4 cm at half prominence`);
+      }
+      mesh.dispose();
+    }
+  } finally { scene.dispose(); engine.dispose(); }
+});
+
+test('stone UVs retain the baseline affine scale while geometry follows the original clods', () => {
+  const engine = new NullEngine(), scene = new Scene(engine);
+  try {
+    for (const seed of [0, 1, 4, 12, 17, 24]) {
+      const mesh = createNineSliceBlock(scene, seed, true), uv = mesh.getVerticesData('uv'), p = mesh.getVerticesData('position');
+      const {stoneRings: rings, bodyDepth} = mesh.metadata.nineSlice;
+      for (let j = 0; j < rings[0].length; j++) {
+        const top = rings[0][j], bottom = rings.at(-1)[j];
+        assert.ok(Math.abs(uv[top * 2 + 1] - 0.53) < 1e-8, 'the stone starts at the original source row');
+        assert.ok(uv[bottom * 2 + 1] >= 0.32 && uv[bottom * 2 + 1] < 0.44, 'geometry terminates at the broad clod contour, not an empty rectangle below it');
+        for (let r = 0; r < rings.length; r++) {
+          const id = rings[r][j];
+          const physicalT = (p[top * 3 + 1] - p[id * 3 + 1]) / (bodyDepth * 0.80);
+          // Per-column cropping would shrink or warp the original clod shapes.
+          assert.ok(Math.abs(uv[id * 2 + 1] - (0.53 - 0.21 * physicalT)) < 1e-8, 'original source V must remain linear through each side column');
+          if (j) assert.ok(uv[id * 2] > uv[rings[r][j - 1] * 2], 'source U progresses once around all four faces');
+          if (r) assert.ok(uv[id * 2 + 1] < uv[rings[r - 1][j] * 2 + 1], 'stone rows descend exactly once');
+        }
+      }
+      const lowerY = rings.at(-1).map(id => p[id * 3 + 1]);
+      assert.ok(Math.max(...lowerY) - Math.min(...lowerY) > 0.15, 'the original broad scallops must remain visible instead of a nearly flat brick bottom');
+      const sideSpan = (uv[rings[0].at(-1) * 2] - uv[rings[0][0] * 2]) / 4;
+      assert.ok(sideSpan > 0.18 && sideSpan < 0.21, 'each side retains the original large clod scale');
+      assert.equal(mesh.getVerticesData('terrainStoneUV').length, uv.length);
+      mesh.dispose();
+    }
+  } finally { scene.dispose(); engine.dispose(); }
+});
+
+test('stone walls keep near-flush contact and the grass blend samples vertical texture detail', () => {
+  const engine = new NullEngine(), scene = new Scene(engine);
+  try {
+    const mesh = createNineSliceBlock(scene, 17), p = mesh.getVerticesData('position'), stoneUV = mesh.getVerticesData('terrainStoneUV');
+    const {width, depth, topVertexCount, stoneRings, bodyOutline} = mesh.metadata.nineSlice;
+    const wall = stoneRings[2];
+    assert.ok(Math.abs(Math.max(...wall.map(id => p[id * 3])) - width / 2) < 1e-8, 'side walls must retain the full tile width');
+    assert.ok(Math.abs(Math.max(...wall.map(id => p[id * 3 + 2])) - depth / 2) < 1e-8, 'side walls must retain the full tile depth');
+    const diagonal = wall.filter(id => p[id * 3] > width / 2 - 0.02 && p[id * 3 + 2] > depth / 2 - 0.02);
+    const nearestCorner = Math.min(...diagonal.map(id => Math.hypot(width / 2 - p[id * 3], depth / 2 - p[id * 3 + 2])));
+    assert.ok(nearestCorner < 0.006, 'rounded stone corners must not leave a vertical sky slit between neighbouring tiles');
+    const lowerV = bodyOutline.map(id => stoneUV[id * 2 + 1]), upperV = Array.from({length: topVertexCount}, (_,id) => stoneUV[id * 2 + 1]);
+    assert.ok(Math.max(...upperV) - Math.max(...lowerV) > 0.015, 'the grass blend must use multiple source rows instead of stretching one row');
+    for (const v of lowerV) assert.ok(Math.abs(v - 0.53) < 1e-8, 'grass hem and stone wall must meet at the same source row');
+  } finally { scene.dispose(); engine.dispose(); }
+});
+
+test('neighbouring tiles show four distinct original stone regions on the same facing wall', () => {
+  const engine = new NullEngine(), scene = new Scene(engine), facingCrops = [];
+  try {
+    for (let seed = 0; seed < 4; seed++) {
+      const mesh = createNineSliceBlock(scene, seed), p = mesh.getVerticesData('position'), uv = mesh.getVerticesData('uv');
+      const {stoneRings, stoneUStart} = mesh.metadata.nineSlice;
+      const front = stoneRings[0].reduce((best, id) => {
+        const score = Math.abs(p[id * 3]) + p[id * 3 + 2];
+        return score < Math.abs(p[best * 3]) + p[best * 3 + 2] ? id : best;
+      }, stoneRings[0][0]);
+      facingCrops.push(uv[front * 2] - stoneUStart);
+      mesh.dispose();
+    }
+    facingCrops.sort((a, b) => a - b);
+    for (let i = 1; i < facingCrops.length; i++) assert.ok(facingCrops[i] - facingCrops[i - 1] > 0.18, 'adjacent tiles must not all show the same pebble and clods');
+  } finally { scene.dispose(); engine.dispose(); }
 });

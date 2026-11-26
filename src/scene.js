@@ -1,3 +1,5 @@
+import { createNineSliceBlock } from './terrain.js';
+export { createNineSliceBlock, nineSliceAxis } from './terrain.js';
 import { Engine } from '@babylonjs/core/Engines/engine.js';
 import { Scene } from '@babylonjs/core/scene.js';
 import { ArcRotateCamera } from '@babylonjs/core/Cameras/arcRotateCamera.js';
@@ -15,14 +17,12 @@ import { MultiMaterial } from '@babylonjs/core/Materials/multiMaterial.js';
 import { DynamicTexture } from '@babylonjs/core/Materials/Textures/dynamicTexture.js';
 import { Texture } from '@babylonjs/core/Materials/Textures/texture.js';
 import { Mesh } from '@babylonjs/core/Meshes/mesh.js';
-import { SubMesh } from '@babylonjs/core/Meshes/subMesh.js';
 import '@babylonjs/core/Meshes/instancedMesh.js';
 import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData.js';
 import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
 import { CreateCylinder } from '@babylonjs/core/Meshes/Builders/cylinderBuilder.js';
 import { CreateSphere } from '@babylonjs/core/Meshes/Builders/sphereBuilder.js';
 import { CreateTorus } from '@babylonjs/core/Meshes/Builders/torusBuilder.js';
-import { CreateBox } from '@babylonjs/core/Meshes/Builders/boxBuilder.js';
 import { CreatePlane } from '@babylonjs/core/Meshes/Builders/planeBuilder.js';
 import { CreateLines } from '@babylonjs/core/Meshes/Builders/linesBuilder.js';
 import { Layer } from '@babylonjs/core/Layers/layer.js';
@@ -86,69 +86,80 @@ function grassHemOffset(seed, x, z) {
   return (noise(seed * 3.7 + x * 4.3, z * 4.3 + 19.3) - 0.5) * 0.055;
 }
 
-// StandardMaterial's hook runs after lighting/alpha test and before image processing.
-// Both sides of the mesh join therefore resolve to exactly the same world-space colour.
+// Authored stone UVs and mesh-local height remain attached through rotation and drops.
 class SharedEarthBlend extends MaterialPluginBase {
-  constructor(material, earthTexture, trimFineRoots = false) {
+  constructor(material, earthTexture, fillTransparentStone = false) {
     super(material, 'SharedEarthBlend', 190, {}, true, true);
     this.earthTexture = earthTexture;
-    this.trimFineRoots = trimFineRoots;
+    this.fillTransparentStone = fillTransparentStone;
     this.doNotSerialize = true;
   }
   getClassName() { return 'SharedEarthBlend'; }
   isReadyForSubMesh() { return this.earthTexture.isReady(); }
+  getAttributes(attributes) { attributes.push('terrainStoneUV', 'terrainBottomLight'); }
   getSamplers(samplers) { samplers.push('terrainEarthSampler'); }
   bindForSubMesh(uniformBuffer) { uniformBuffer.setTexture('terrainEarthSampler', this.earthTexture); }
   getActiveTextures(textures) { textures.push(this.earthTexture); }
-  hasTexture(texture) { return texture === this.earthTexture; }
+  hasTexture(value) { return value === this.earthTexture; }
   getCustomCode(shaderType) {
+    if (shaderType === 'vertex') return {
+      CUSTOM_VERTEX_DEFINITIONS: `
+        attribute vec2 terrainStoneUV;
+        attribute float terrainBottomLight;
+        varying vec2 vTerrainStoneUV;
+        varying float vTerrainBottomLight;
+        varying vec3 vTerrainLocalPosition;
+      `,
+      CUSTOM_VERTEX_MAIN_END: `
+        vTerrainStoneUV = terrainStoneUV;
+        vTerrainBottomLight = terrainBottomLight;
+        vTerrainLocalPosition = positionUpdated;
+      `,
+    };
     if (shaderType !== 'fragment') return null;
     return {
-      CUSTOM_FRAGMENT_DEFINITIONS: `
-        uniform sampler2D terrainEarthSampler;
-        float terrainBlendNoise(vec2 p) {
-          vec2 cell = floor(p), f = fract(p);
-          f = f * f * (3.0 - 2.0 * f);
-          float a = fract(sin(dot(cell, vec2(127.1, 311.7))) * 43758.5453);
-          float b = fract(sin(dot(cell + vec2(1.0, 0.0), vec2(127.1, 311.7))) * 43758.5453);
-          float c = fract(sin(dot(cell + vec2(0.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
-          float d = fract(sin(dot(cell + vec2(1.0), vec2(127.1, 311.7))) * 43758.5453);
-          return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
-        }
-      `,
-      CUSTOM_FRAGMENT_BEFORE_LIGHTS: this.trimFineRoots ? `
-        // Keep broad original stone silhouettes, suppress only thin hanging alpha roots.
-        if (vDiffuseUV.y < 0.45) {
-          float leftCoverage = texture2D(diffuseSampler, vDiffuseUV + vec2(-0.006, 0.0)).a;
-          float rightCoverage = texture2D(diffuseSampler, vDiffuseUV + vec2(0.006, 0.0)).a;
-          if (min(leftCoverage, rightCoverage) < 0.48) discard;
+      // Always register this hook, including during MaterialPluginBase construction.
+      CUSTOM_FRAGMENT_UPDATE_ALPHA: this.fillTransparentStone ? `
+        if (baseColor.a < 0.98) {
+          vec4 originalStone = baseColor;
+          vec4 filledStone = baseColor;
+          // Only transparent source pixels need a colour. Search nearby original
+          // opaque pixels; never resize, mirror or repeat the existing stone art.
+          vec2 stoneTexel = vec2(1.0 / 2172.0, 1.0 / 724.0);
+          for (int ring = 1; ring <= 12; ring++) {
+            if (filledStone.a < 0.98) {
+              vec2 radius = stoneTexel * (float(ring) * 7.0);
+              vec4 above = texture2D(diffuseSampler, vDiffuseUV + vec2(0.0, radius.y));
+              vec4 left = texture2D(diffuseSampler, vDiffuseUV - vec2(radius.x, 0.0));
+              vec4 right = texture2D(diffuseSampler, vDiffuseUV + vec2(radius.x, 0.0));
+              filledStone = above.a >= 0.98 ? above : left.a >= 0.98 ? left : right;
+            }
+          }
+          baseColor.rgb = mix(filledStone.rgb, originalStone.rgb, smoothstep(0.0, 0.98, originalStone.a));
+          baseColor.a = 1.0;
         }
       ` : '',
+      CUSTOM_FRAGMENT_DEFINITIONS: `
+        uniform sampler2D terrainEarthSampler;
+        varying vec2 vTerrainStoneUV;
+        varying float vTerrainBottomLight;
+        varying vec3 vTerrainLocalPosition;
+      `,
       CUSTOM_FRAGMENT_BEFORE_FOG: `
-        float terrainNoise = terrainBlendNoise(vPositionW.xz * 8.0);
-        float terrainMix = 1.0 - smoothstep(-0.005, 0.16 + (terrainNoise - 0.5) * 0.10, vPositionW.y);
-        // The shared colour only bridges the material seam. Below it, retain the
-        // original single-coverage artwork and its unique stone arrangement.
-        terrainMix *= smoothstep(-0.22, -0.08, vPositionW.y);
-        if (terrainMix > 0.001) {
-          float terrainFingers = (terrainBlendNoise(vec2(vPositionW.x * 4.5, 11.0)) - 0.5) * 0.12;
-          float terrainY = vPositionW.y + terrainFingers;
-          // Sample only the original stone, excluding the painted grass header.
-          // World-space phase stays identical on both sides of the grass/earth join.
-          float terrainV = clamp(0.49 + (terrainY + 0.045) * 0.20, 0.43, 0.525);
-          vec2 terrainUV = vec2(
-            clamp(0.025 + (vPositionW.x + 2.9) / 5.8 * 0.95, 0.04, 0.96),
-            terrainV
-          );
-          vec4 terrainSample = texture2D(terrainEarthSampler, terrainUV);
-          // The colour projection must never sample the transparent silhouette as black.
-          if (terrainSample.a < 0.97) terrainSample = texture2D(terrainEarthSampler, vec2(terrainUV.x, 0.46));
-          vec3 terrainNormal = normalize(vec3(-0.10, 0.15, -1.0));
-          float terrainLight = 0.80 + 0.20 * max(dot(terrainNormal, normalize(vec3(-0.8, 1.4, -0.55))), 0.0);
-          terrainLight *= 0.92 + 0.08 * smoothstep(-0.70, 0.10, vPositionW.y);
-          vec3 terrainColour = terrainSample.rgb * terrainLight * vec3(1.02, 1.0, 0.95);
-          color.rgb = mix(color.rgb, terrainColour, terrainMix);
+        float edgeNoise = sin(vTerrainLocalPosition.x * 23.0 + sin(vTerrainLocalPosition.z * 17.0)) * 0.018;
+        float seamMix = (1.0 - smoothstep(-0.005, 0.14 + edgeNoise, vTerrainLocalPosition.y))
+          * smoothstep(-0.22, -0.08, vTerrainLocalPosition.y);
+        if (seamMix > 0.001) {
+          // Match the accepted front's short moss-to-stone transition. This is
+          // local height, so the authored stone stays attached to moving blocks.
+          float seamV = clamp(0.49 + (vTerrainLocalPosition.y + 0.045) * 0.20, 0.43, 0.525);
+          vec3 stoneColour = texture2D(terrainEarthSampler, vec2(vTerrainStoneUV.x, seamV)).rgb;
+          float stoneLight = 0.80 + 0.18 * max(dot(normalize(normalW), normalize(vec3(-0.8, 1.4, -0.55))), 0.0);
+          color.rgb = mix(color.rgb, stoneColour * stoneLight * vec3(1.02, 1.0, 0.95), seamMix);
         }
+        // Soft cloud bounce reaches only the authored underside, fading out at
+        // its shared rim; side lighting and draw calls stay unchanged.
+        color.rgb += texture2D(terrainEarthSampler, vTerrainStoneUV).rgb * (0.14 * vTerrainBottomLight);
       `,
     };
   }
@@ -223,143 +234,6 @@ function paintGround(ctx, size, variant, rock = false) {
   }
 }
 
-// Geometry and source UV each preserve their end caps; only the central interval stretches.
-export function nineSliceAxis(value, halfExtent, capWidth, uvStart, uvEnd, uvCap) {
-  const low = -halfExtent, high = halfExtent;
-  if (value <= low + capWidth) return uvStart + (value - low) / capWidth * uvCap;
-  if (value >= high - capWidth) return uvEnd - (high - value) / capWidth * uvCap;
-  return uvStart + uvCap + (value - low - capWidth) / (2 * (halfExtent - capWidth)) * (uvEnd - uvStart - 2 * uvCap);
-}
-
-export function createNineSliceBlock(scene, seed = 0, frontArt = false, { width = 1.002, depth = 1.002, capWidth = 0.055, capDepth = capWidth } = {}) {
-  if (width <= capWidth * 2 || depth <= capDepth * 2 || Math.min(capWidth, capDepth) <= 0) throw new RangeError('Nine-slice caps must fit inside the block.');
-  const mesh = new Mesh('nine-slice-earth-block-' + seed, scene), r = randomSource(701 + seed * 47);
-  const uvRandom = randomSource(113 + seed * 61), uvTurn = Math.floor(uvRandom() * 4);
-  const uvSpan = 0.43, uvOffsetU = uvRandom() * (1 - uvSpan), uvOffsetV = uvRandom() * (1 - uvSpan), uvCap = 0.065;
-  const halfX = width / 2, halfZ = depth / 2, coreX = halfX - capWidth, coreZ = halfZ - capDepth;
-  const curveDrop = 0.055, edgeHeight = TURF_HEIGHT - curveDrop, grassBottom = -0.045, segments = 8, wrapSegments = 2;
-  const positions = [], indices = [], uvs = [], normals = [], welded = new Map(), patches = [];
-  const curveBoundary = new Set(), soilBoundary = new Set();
-  let patchVertices;
-  const vertex = (x, y, z, logicalX, logicalZ, nx, ny, nz) => {
-    y += grassHemOffset(seed, x, z) * clamp((edgeHeight - y) / (edgeHeight - grassBottom));
-    let u = nineSliceAxis(logicalX, halfX, capWidth, 0, uvSpan, uvCap), v = nineSliceAxis(logicalZ, halfZ, capDepth, 0, uvSpan, uvCap);
-    [u, v] = uvTurn === 0 ? [u, v] : uvTurn === 1 ? [uvSpan - v, u] : uvTurn === 2 ? [uvSpan - u, uvSpan - v] : [v, uvSpan - u];
-    u += uvOffsetU; v += uvOffsetV;
-    const key = [x, y, z, u, v].map((value) => value.toFixed(10)).join(',');
-    let id = welded.get(key);
-    if (id === undefined) {
-      id = positions.length / 3; welded.set(key, id);
-      const length = Math.hypot(nx, ny, nz);
-      positions.push(x, y, z); uvs.push(u, v); normals.push(nx / length, ny / length, nz / length);
-    }
-    patchVertices.add(id); return id;
-  };
-  const triangle = (a, b, c) => {
-    const p = (i) => Vector3.FromArray(positions, i * 3);
-    const cross = Vector3.Cross(p(b).subtract(p(a)), p(c).subtract(p(a)));
-    if (cross.lengthSquared() < 1e-18) return;
-    const expected = Vector3.FromArray(normals, a * 3).add(Vector3.FromArray(normals, b * 3)).add(Vector3.FromArray(normals, c * 3));
-    if (Vector3.Dot(cross, expected) > 0) indices.push(a, c, b); else indices.push(a, b, c);
-  };
-  const quad = (a, b, c, d) => { triangle(a, b, c); triangle(a, c, d); };
-  const patch = (row, col, kind, build) => {
-    patchVertices = new Set(); const indexStart = indices.length;
-    build(); patches.push({ row, col, kind, indexStart, indexCount: indices.length - indexStart, vertexIndices: [...patchVertices] });
-  };
-  patch(1, 1, 'center', () => {
-    const a = vertex(-coreX, TURF_HEIGHT, -coreZ, -coreX, -coreZ, 0, 1, 0);
-    const b = vertex(coreX, TURF_HEIGHT, -coreZ, coreX, -coreZ, 0, 1, 0);
-    const c = vertex(coreX, TURF_HEIGHT, coreZ, coreX, coreZ, 0, 1, 0);
-    const d = vertex(-coreX, TURF_HEIGHT, coreZ, -coreX, coreZ, 0, 1, 0); quad(a, b, c, d);
-  });
-  const section = (level) => {
-    if (level <= segments) {
-      const angle = level / segments * Math.PI / 2;
-      return { radial: Math.sin(angle), logical: level / segments, y: TURF_HEIGHT - curveDrop * (1 - Math.cos(angle)), sin: Math.sin(angle), cos: Math.cos(angle), inset: 0, wrap: 0 };
-    }
-    const t = (level - segments) / wrapSegments, drop = (edgeHeight - grassBottom) * t;
-    return { radial: 1, logical: 1, y: edgeHeight - drop, sin: 1, cos: 0, inset: 0.006 * t, wrap: drop };
-  };
-  for (const axis of ['x', 'z']) for (const sign of [-1, 1]) {
-    patch(axis === 'z' ? (sign < 0 ? 0 : 2) : 1, axis === 'x' ? (sign < 0 ? 0 : 2) : 1, 'edge', () => {
-      const rows = [];
-      for (let level = 0; level <= segments + wrapSegments; level++) {
-        const q = section(level), ids = [];
-        for (const end of [-1, 1]) {
-          const x = axis === 'x' ? sign * (coreX + capWidth * q.radial - q.inset) : end * coreX;
-          const z = axis === 'z' ? sign * (coreZ + capDepth * q.radial - q.inset) : end * coreZ;
-          const lx = axis === 'x' ? sign * (coreX + capWidth * q.logical + q.wrap) : x;
-          const lz = axis === 'z' ? sign * (coreZ + capDepth * q.logical + q.wrap) : z;
-          const id = vertex(x, q.y, z, lx, lz, axis === 'x' ? sign * q.sin / capWidth : 0, q.cos / curveDrop, axis === 'z' ? sign * q.sin / capDepth : 0);
-          if (level === segments) curveBoundary.add(id);
-          if (level === segments + wrapSegments) soilBoundary.add(id);
-          ids.push(id);
-        }
-        rows.push(ids);
-        if (level) quad(rows[level - 1][0], rows[level - 1][1], ids[1], ids[0]);
-      }
-    });
-  }
-  for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
-    patch(sz < 0 ? 0 : 2, sx < 0 ? 0 : 2, 'corner', () => {
-      const rows = [];
-      for (let level = 0; level <= segments + wrapSegments; level++) {
-        const q = section(level), ids = [];
-        for (let arc = 0; arc <= segments; arc++) {
-          const angle = arc / segments * Math.PI / 2, cx = Math.cos(angle), cz = Math.sin(angle);
-          const x = sx * (coreX + (capWidth * q.radial - q.inset) * cx), z = sz * (coreZ + (capDepth * q.radial - q.inset) * cz);
-          const lx = sx * (coreX + (capWidth * q.logical + q.wrap) * cx), lz = sz * (coreZ + (capDepth * q.logical + q.wrap) * cz);
-          const id = vertex(x, q.y, z, lx, lz, sx * q.sin * cx / capWidth, q.cos / curveDrop, sz * q.sin * cz / capDepth);
-          if (level === segments) curveBoundary.add(id);
-          if (level === segments + wrapSegments) soilBoundary.add(id);
-          ids.push(id);
-          if (level && arc) quad(rows[level - 1][arc - 1], rows[level - 1][arc], ids[arc], ids[arc - 1]);
-        }
-        rows.push(ids);
-      }
-    });
-  }
-  const byAngle = (a, b) => Math.atan2(positions[a * 3 + 2], positions[a * 3]) - Math.atan2(positions[b * 3 + 2], positions[b * 3]);
-  const outline = [...curveBoundary].sort(byAngle), bodyOutline = [...soilBoundary].sort(byAngle);
-  const topVertexCount = positions.length / 3, topIndexCount = indices.length, topNormals = [...normals];
-  const bodyDepth = 0.72 + r() * 0.14, solidDepth = frontArt ? bodyDepth * 0.48 : bodyDepth, rings = 4, n = bodyOutline.length;
-  const soilTop = grassBottom + 0.004;
-  for (let ring = 0; ring <= rings; ring++) {
-    const t = ring / rings;
-    for (let j = 0; j <= n; j++) {
-      const id = bodyOutline[j % n], x = positions[id * 3], z = positions[id * 3 + 2];
-      // The opaque backing must stay behind the curved alpha soil face, including its corners.
-      const inset = (frontArt ? 0.05 : 0.004) + t * t * (0.008 + noise(seed * 2 + j, 7.1) * 0.014);
-      const lowerVariation = (noise(seed * 1.9 + j * 0.7, 11.3) - 0.5) * 0.065;
-      positions.push(x * (1 - inset), positions[id * 3 + 1] + 0.004 - t * (solidDepth + lowerVariation), z * (1 - inset)); uvs.push(j / (n / 4), t);
-    }
-  }
-  for (let ring = 0; ring < rings; ring++) for (let j = 0; j < n; j++) {
-    const a = topVertexCount + ring * (n + 1) + j, b = a + 1; indices.push(a, b + n + 1, b, a, a + n + 1, b + n + 1);
-  }
-  const bottomStart = topVertexCount + rings * (n + 1), bottomCenter = positions.length / 3;
-  positions.push(0, soilTop - solidDepth, 0); uvs.push(0.5, 0.5);
-  for (let j = 0; j < n; j++) indices.push(bottomCenter, bottomStart + j + 1, bottomStart + j);
-  VertexData.ComputeNormals(positions, indices, normals);
-  for (let i = 0; i < topNormals.length; i++) normals[i] = topNormals[i];
-  const colors = new Array(positions.length / 3 * 4).fill(1);
-  for (let id = 0; id < topVertexCount; id++) {
-    const nx = normals[id * 3], ny = normals[id * 3 + 1], nz = normals[id * 3 + 2], horizontal = Math.hypot(nx, nz);
-    const facing = horizontal > 0.001 ? clamp((-nx * 0.8 - nz * 0.55) / (horizontal * Math.hypot(0.8, 0.55))) ** 1.3 : 0;
-    const bend = 1 - ny;
-    colors[id * 4] = 1 - bend * (0.28 - facing * 0.22);
-    colors[id * 4 + 1] = 1 - bend * (0.28 - facing * 0.14);
-    colors[id * 4 + 2] = 1 - bend * (0.28 + facing * 0.08);
-  }
-  const data = new VertexData(); Object.assign(data, { positions, indices, normals, uvs, colors }); data.applyToMesh(mesh);
-  mesh.releaseSubMeshes();
-  new SubMesh(0, 0, topVertexCount, 0, topIndexCount, mesh);
-  new SubMesh(1, topVertexCount, positions.length / 3 - topVertexCount, topIndexCount, indices.length - topIndexCount, mesh);
-  mesh.metadata = { nineSlice: { width, depth, capWidth, capDepth, uvCap, edgeHeight, grassBottom, soilTop, topVertexCount, outline, bodyOutline, patches, bodyDepth, solidDepth, curveSegments: segments } };
-  return mesh;
-}
-
 function paintPine(ctx, width, height) {
   const r = randomSource(998);
   ctx.clearRect(0, 0, width, height);
@@ -383,7 +257,7 @@ function paintPine(ctx, width, height) {
   }
 }
 
-export async function createWorld(canvas, { state, onTileClick, onHover, reducedMotion = false, labelsRoot }) {
+export async function createWorld(canvas, { state, onTileClick, onHover, onViewState, reducedMotion = false, labelsRoot }) {
   const engine = new Engine(canvas, true, { alpha: true, stencil: true, preserveDrawingBuffer: false, powerPreference: 'high-performance' });
   engine.setHardwareScalingLevel(1 / Math.min(window.devicePixelRatio || 1, 1.5));
   const scene = new Scene(engine);
@@ -424,12 +298,14 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     loadArt('soil-stylized-v2.png'),
     loadArt('earth-front-grassy-v4.png', true),
   ]);
-  const blendEarth = (mat, trimFineRoots = false) => { if (earthFrontArt) new SharedEarthBlend(mat, earthFrontArt, trimFineRoots); };
-  const stone = material('worn-cut-stone', '#b9a58b');
-  stone.diffuseTexture = soilArt || texture(scene, 'fallback-stone', 256, (ctx, size) => paintGround(ctx, size, 3, true));
-  const topsoil = material('continuous-natural-soil', '#e0d3c0'); topsoil.diffuseTexture = soilArt || stone.diffuseTexture;
-  topsoil.emissiveColor.set(0.24, 0.23, 0.22);
-  blendEarth(topsoil);
+  const blendEarth = (mat, fillTransparentStone = false) => { if (earthFrontArt) new SharedEarthBlend(mat, earthFrontArt, fillTransparentStone); };
+  const topsoil = material('closed-original-stone', '#c7ccb3');
+  topsoil.diffuseTexture = earthFrontArt || soilArt || texture(scene, 'fallback-stone', 256, (ctx, size) => paintGround(ctx, size, 3, true));
+  topsoil.useAlphaFromDiffuseTexture = false;
+  topsoil.transparencyMode = StandardMaterial.MATERIAL_OPAQUE;
+  topsoil.specularColor.set(0, 0, 0);
+  topsoil.emissiveColor.set(0.045, 0.05, 0.025);
+  blendEarth(topsoil, true);
   const soilFill = new DirectionalLight('front-soil-fill', new Vector3(0.15, -0.20, 1), scene);
   soilFill.diffuse = hex('#e8dfd1'); soilFill.specular.set(0, 0, 0); soilFill.intensity = 0.44;
   // Keep diffuse below the shader's lighting clamp so the three turf tones remain distinct.
@@ -455,57 +331,37 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
   contactMaterial.transparencyMode = StandardMaterial.MATERIAL_ALPHABLEND;
   const ringHero = material('hero-ground-light', '#d7bf72', '#7e7041');
   const ringEnemy = material('enemy-ground-light', '#cf7165', '#843d3a');
-  const STEP = 1.16;
-  const coord = (index) => new Vector3((index % SIZE - 2) * STEP, 0, (2 - Math.floor(index / SIZE)) * STEP);
+  const STEP = 1.16, DROP_HEIGHT = -1.2;
+  const boardRoot = new TransformNode('board-view-transform', scene);
+  let boardPreviewSize = null, previewTerrain = null, rotation = 0, dropMode = false, viewBusy = false;
+  const flatCoord = (index, size = SIZE) => new Vector3((index % size - (size - 1) / 2) * STEP, 0, ((size - 1) / 2 - Math.floor(index / size)) * STEP);
   const screenUp = new Vector3(0, Math.sin(camera.beta), Math.cos(camera.beta));
   const screenRight = new Vector3(1, 0, 0);
-
-  let boardPreviewSize = null, previewTerrain = null;
-  const textureBoardSpan = STEP * SIZE;
+  const localDirection = (direction) => Vector3.TransformNormal(direction, Matrix.RotationY(-boardRoot.rotation.y));
+  const localScreenUp = () => localDirection(screenUp);
+  const localScreenRight = () => localDirection(screenRight);
+  const worldPoint = (position) => Vector3.TransformCoordinates(position, boardRoot.computeWorldMatrix(true));
   const buildTerrain = (boardSize, label) => {
-    const beforeMeshes = new Set(scene.meshes), beforeMaterials = new Set(scene.materials);
-    const root = new TransformNode('terrain-' + label, scene);
-    const terrainCoord = (index) => new Vector3((index % boardSize - (boardSize - 1) / 2) * STEP, 0, ((boardSize - 1) / 2 - Math.floor(index / boardSize)) * STEP);
-    // Flush grass surfaces sit on overlapping, independently eroded soil clumps.
-    const groundTiles = [];
+    const root = new TransformNode('terrain-' + label, scene); root.parent = boardRoot;
+    const groundTiles = [], tileRoots = [], heights = new Array(boardSize * boardSize).fill(0), details = [];
+    const scatterMaterials = ['#bcb493', '#969b70', '#64704c'].map((color, i) => {
+      const mat = material('turf-fragments-' + label + '-' + i, color); mat.specularColor.set(0, 0, 0); return mat;
+    });
     for (let i = 0; i < boardSize * boardSize; i++) {
-      const tile = createNineSliceBlock(scene, i, Boolean(earthFrontArt) && Math.floor(i / boardSize) === boardSize - 1);
+      const tileRoot = new TransformNode('tile-height-' + label + '-' + i, scene);
+      tileRoot.parent = root; tileRoot.position.copyFrom(flatCoord(i, boardSize)); tileRoots.push(tileRoot);
+      const tile = createNineSliceBlock(scene, i, false);
+      tile.parent = tileRoot; tile.scaling.set(STEP, 1, STEP);
       tile.material = groundMaterials[(i * 7 + Math.floor(i / boardSize) * 2) % groundMaterials.length];
-      tile.position = terrainCoord(i); tile.scaling.set(STEP, 1, STEP);
-      tile.receiveShadows = true; shadows.addShadowCaster(tile); tile.metadata = { ...tile.metadata, tileIndex: i }; groundTiles.push(tile); glow.addExcludedMesh(tile);
-    }
-    soilFill.includedOnlyMeshes.push(...groundTiles);
-    // Recessed earth joins only neighbouring cells, so the seams reveal soil instead of sky.
-    const jointMaterial = material('recessed-shared-earth', '#766955');
-    jointMaterial.diffuseTexture = soilArt || stone.diffuseTexture;
-    jointMaterial.emissiveColor.set(0.045, 0.035, 0.025);
-    blendEarth(jointMaterial);
-    const jointParts = [], innerLimit = STEP * boardSize / 2 - 0.18;
-    for (let row = 0; row < boardSize; row++) for (let col = 0; col < boardSize; col++) {
-      const p = terrainCoord(row * boardSize + col);
-      for (const axis of ['x', 'z']) {
-        if ((axis === 'x' && col === boardSize - 1) || (axis === 'z' && row === boardSize - 1)) continue;
-        const along = axis === 'x' ? p.z : p.x;
-        const low = Math.max(-innerLimit, along - STEP * 0.55), high = Math.min(innerLimit, along + STEP * 0.55);
-        const box = CreateBox('shared-earth-part', { width: axis === 'x' ? 0.16 : high - low, height: 0.40, depth: axis === 'z' ? 0.16 : high - low }, scene);
-        box.position.set(axis === 'x' ? p.x + STEP / 2 : (low + high) / 2, -0.235, axis === 'z' ? p.z - STEP / 2 : (low + high) / 2);
-        box.material = jointMaterial; box.isPickable = false; jointParts.push(box);
-      }
-    }
-    const soilJoins = jointParts.length ? Mesh.MergeMeshes(jointParts, true, true) : null;
-    if (soilJoins) { soilJoins.name = 'recessed-internal-earth-joins'; soilJoins.isPickable = false; glow.addExcludedMesh(soilJoins); }
-    // Small irregular turf fragments bridge texture grain and the larger tile colour fields.
-    const scatter = ['#bcb493', '#969b70', '#64704c'].map((color, i) => ({
-      positions: [], indices: [], mat: material(`turf-fragments-${i}`, color),
-    }));
-    for (let tileIndex = 0; tileIndex < boardSize * boardSize; tileIndex++) {
-      const r = randomSource(1701 + tileIndex * 83), center = terrainCoord(tileIndex);
-      const count = Math.floor(r() ** 1.3 * 31), clusters = Array.from({ length: 3 }, () => [(r() - 0.5) * 0.64, (r() - 0.5) * 0.64]);
+      tile.receiveShadows = true; shadows.addShadowCaster(tile); glow.addExcludedMesh(tile);
+      tile.metadata = { ...tile.metadata, tileIndex: i }; groundTiles.push(tile); soilFill.includedOnlyMeshes.push(tile);
+      const scatter = scatterMaterials.map((mat) => ({ positions: [], indices: [], mat }));
+      const r = randomSource(1701 + i * 83), count = Math.floor(r() ** 1.3 * 31);
+      const clusters = Array.from({ length: 3 }, () => [(r() - 0.5) * 0.64, (r() - 0.5) * 0.64]);
       for (let fragment = 0; fragment < count; fragment++) {
         const group = r() < 0.17 ? 2 : r() < 0.55 ? 0 : 1, batch = scatter[group];
         const cluster = clusters[Math.floor(r() * clusters.length)];
-        const x = center.x + clamp(cluster[0] + (r() - 0.5) * 0.23, -0.35, 0.35);
-        const z = center.z + clamp(cluster[1] + (r() - 0.5) * 0.23, -0.35, 0.35);
+        const x = clamp(cluster[0] + (r() - 0.5) * 0.23, -0.35, 0.35), z = clamp(cluster[1] + (r() - 0.5) * 0.23, -0.35, 0.35);
         const radius = group === 2 ? 0.020 + r() * 0.018 : 0.010 + r() * 0.015;
         const sides = 3 + Math.floor(r() * 3), first = batch.positions.length / 3, turn = r() * Math.PI * 2;
         batch.positions.push(x, TURF_HEIGHT + 0.0025, z);
@@ -515,81 +371,28 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
         }
         for (let point = 0; point < sides; point++) batch.indices.push(first, first + point + 1, first + (point + 1) % sides + 1);
       }
+      scatter.forEach(({ positions, indices, mat }, group) => {
+        if (!indices.length) return;
+        const mesh = new Mesh('turf-fragments-' + label + '-' + i + '-' + group, scene), data = new VertexData(), normals = [];
+        VertexData.ComputeNormals(positions, indices, normals); Object.assign(data, { positions, indices, normals }); data.applyToMesh(mesh);
+        mesh.parent = tileRoot; mesh.material = mat; mesh.isPickable = false; glow.addExcludedMesh(mesh); details.push(mesh);
+      });
     }
-    scatter.forEach(({ positions, indices, mat }, i) => {
-      if (!indices.length) return;
-      const mesh = new Mesh(`clustered-turf-fragments-${i}`, scene), data = new VertexData(), normals = [];
-      VertexData.ComputeNormals(positions, indices, normals); Object.assign(data, { positions, indices, normals }); data.applyToMesh(mesh);
-      mat.specularColor.set(0, 0, 0); mesh.material = mat; mesh.isPickable = false; glow.addExcludedMesh(mesh);
-    });
-    if (earthFrontArt) {
-      const frontMaterial = material('exposed-earth-front-art', '#c7ccb3');
-      frontMaterial.emissiveColor.set(0.045, 0.05, 0.025);
-      frontMaterial.specularColor.set(0, 0, 0);
-      frontMaterial.diffuseTexture = earthFrontArt; frontMaterial.useAlphaFromDiffuseTexture = true;
-      frontMaterial.transparencyMode = StandardMaterial.MATERIAL_ALPHATEST;
-      frontMaterial.alphaCutOff = 0.48; frontMaterial.backFaceCulling = false;
-      for (let col = 0; col < boardSize; col++) {
-        const block = groundTiles[(boardSize - 1) * boardSize + col], profile = block.metadata.nineSlice;
-        const width = (profile.width - 0.012) * STEP, height = profile.bodyDepth * 0.80;
-        const centerX = block.position.x, top = profile.grassBottom + 0.002;
-        const leftExtent = col > 0 ? STEP / 2 : width / 2;
-        const rightExtent = col < boardSize - 1 ? STEP / 2 : width / 2;
-        const leftHeight = col > 0 ? (height + groundTiles[(boardSize - 1) * boardSize + col - 1].metadata.nineSlice.bodyDepth * 0.80) / 2 : height;
-        const rightHeight = col < boardSize - 1 ? (height + groundTiles[(boardSize - 1) * boardSize + col + 1].metadata.nineSlice.bodyDepth * 0.80) / 2 : height;
-        // Show the original stones once, preserving their order and landmarks.
-        const uvTop = 0.53, uvBottom = 0.32;
-        const coreX = profile.width / 2 - profile.capWidth, coreZ = profile.depth / 2 - profile.capDepth;
-        const positions = [], indices = [], uvs = [], normals = [], across = 24, down = 12;
-        for (let row = 0; row <= down; row++) for (let x = 0; x <= across; x++) {
-          const u = x / across, t = row / down;
-          const edgeInset = t * t * 0.006, localX = (-leftExtent + u * (leftExtent + rightExtent)) / STEP;
-          const internalEdge = localX < 0 ? col > 0 : col < boardSize - 1;
-          const cornerRatio = internalEdge ? 0 : clamp((Math.abs(localX) - coreX) / (profile.capWidth - 0.010));
-          const localZ = -coreZ - (profile.capDepth - 0.010) * Math.sqrt(1 - cornerRatio * cornerRatio);
-          const seed = (boardSize - 1) * boardSize + col;
-          const ownHem = grassHemOffset(seed, localX, localZ);
-          const worldX = centerX + localX * STEP;
-          const bottomRelief = 0.30 * (noise(worldX * 2.6, 17.3) - 0.5) + 0.04 * (noise(worldX * 7.3, 23.1) - 0.5);
-          const edgeWeight = clamp((Math.abs(u - 0.5) - 0.25) * 4);
-          const smoothWeight = edgeWeight * edgeWeight * (3 - 2 * edgeWeight);
-          const sharedHem = !internalEdge ? ownHem : localX < 0
-            ? Math.max(grassHemOffset(seed, -0.5, localZ), grassHemOffset(seed - 1, 0.5, localZ)) + 0.085
-            : Math.max(grassHemOffset(seed, 0.5, localZ), grassHemOffset(seed + 1, -0.5, localZ)) + 0.085;
-          const hem = (ownHem + (sharedHem - ownHem) * smoothWeight) * (1 - t);
-          const localHeight = height + ((u < 0.5 ? leftHeight : rightHeight) - height) * smoothWeight;
-          positions.push(worldX, top + hem - t * localHeight + t * t * bottomRelief, block.position.z + localZ * STEP + edgeInset - 0.002);
-          // Each separate front belongs entirely to its own block, with preserved source detail.
-          const acrossIsland = (worldX + textureBoardSpan / 2) / textureBoardSpan;
-          uvs.push(0.025 + acrossIsland * 0.95, uvTop + (uvBottom - uvTop) * t);
-        }
-        for (let row = 0; row < down; row++) for (let x = 0; x < across; x++) {
-          const a = row * (across + 1) + x, b = a + 1, c = a + across + 1;
-          indices.push(a, c, b, b, c, c + 1);
-        }
-        VertexData.ComputeNormals(positions, indices, normals);
-        const face = new Mesh(`eroded-front-cutout-${col}`, scene), data = new VertexData();
-        Object.assign(data, { positions, indices, normals, uvs }); data.applyToMesh(face);
-        face.material = frontMaterial; face.isPickable = false; face.receiveShadows = true; glow.addExcludedMesh(face); soilFill.includedOnlyMeshes.push(face);
-      }
-      blendEarth(frontMaterial, true);
-    }
-    const meshes = scene.meshes.filter((mesh) => !beforeMeshes.has(mesh));
-    const materials = scene.materials.filter((mat) => !beforeMaterials.has(mat));
-    meshes.forEach((mesh) => { mesh.parent = root; });
     return {
-      root, groundTiles,
+      root, groundTiles, tileRoots, heights, size: boardSize,
       dispose() {
-        const removed = new Set(meshes);
+        const removed = new Set([...groundTiles, ...details]);
         soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter((mesh) => !removed.has(mesh));
-        meshes.forEach((mesh) => { shadows.removeShadowCaster(mesh, false); glow.removeExcludedMesh(mesh); mesh.dispose(false, false); });
-        materials.forEach((mat) => mat.dispose(false, false));
-        root.dispose();
+        removed.forEach((mesh) => { shadows.removeShadowCaster(mesh, false); glow.removeExcludedMesh(mesh); mesh.dispose(false, false); });
+        scatterMaterials.forEach((mat) => mat.dispose(false, false)); root.dispose();
       },
     };
   };
   const battleTerrain = buildTerrain(SIZE, 'battle');
   const { groundTiles } = battleTerrain;
+  const activeTerrain = () => previewTerrain || battleTerrain;
+  const coord = (index) => flatCoord(index).add(new Vector3(0, battleTerrain.heights[index] || 0, 0));
+  const viewCoord = (index) => flatCoord(index, activeTerrain().size).add(new Vector3(0, activeTerrain().heights[index] || 0, 0));
   const makeOverlayMaterial = (name, color, alpha) => {
     const m = material(name, color, color); m.disableLighting = true; m.alpha = alpha;
     m.transparencyMode = StandardMaterial.MATERIAL_ALPHABLEND; m.backFaceCulling = false; return m;
@@ -612,7 +415,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     data.indices = tile.getIndices().slice(0, top.indexCount);
     data.normals = normals;
     const mesh = new Mesh(name, scene); data.applyToMesh(mesh);
-    mesh.position.copyFrom(coord(index)); mesh.scaling.copyFrom(tile.scaling);
+    mesh.parent = boardRoot; mesh.position.copyFrom(coord(index)); mesh.scaling.copyFrom(tile.scaling);
     mesh.isPickable = false; glow.addExcludedMesh(mesh); return mesh;
   };
   const turfOutline = (index, lift = 0.009) => {
@@ -632,22 +435,25 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     };
     const p = coord(index);
     const border = CreateLines(`range-outline-${index}`, { points: turfOutline(index) }, scene);
+    border.parent = boardRoot;
     border.position.copyFrom(p); border.color = hex('#9fc5de'); border.alpha = 0.6; border.isPickable = false; border.setEnabled(false);
     const dangerBorder = CreateLines(`danger-outline-${index}`, { points: turfOutline(index, 0.011) }, scene);
+    dangerBorder.parent = boardRoot;
     dangerBorder.position.copyFrom(p); dangerBorder.color = hex('#ff9782'); dangerBorder.alpha = 1; dangerBorder.isPickable = false; dangerBorder.setEnabled(false);
     return { telegraph: make('intent', telegraphMat, 0.005), target: make('target', targetMat, 0.008), preview: make('preview', previewGoodMat, 0.011), border, dangerBorder };
   });
   const focus = CreateLines('keyboard-pointer-focus', { points: turfOutline(0, 0.015) }, scene);
+  focus.parent = boardRoot;
   focus.color = hex('#fff1c5'); focus.isPickable = false; focus.setEnabled(false);
   let hovered = null, keyboardFocus = null;
   const setFocus = (index) => {
-    if (boardPreviewSize !== null) { focus.setEnabled(false); return; }
-    keyboardFocus = Number.isInteger(index) && index >= 0 && index < 25 ? index : null;
+    if (boardPreviewSize !== null && !dropMode) { focus.setEnabled(false); return; }
+    keyboardFocus = Number.isInteger(index) && index >= 0 && index < activeTerrain().size ** 2 ? index : null;
     const active = keyboardFocus ?? hovered;
-    focus.setEnabled(active !== null); if (active !== null) focus.position.copyFrom(coord(active));
+    focus.setEnabled(active !== null); if (active !== null) focus.position.copyFrom(viewCoord(active));
   };
   const showTargeting = (preview) => {
-    if (boardPreviewSize !== null) preview = null;
+    if (boardPreviewSize !== null || dropMode) preview = null;
     const targets = new Set(preview?.targets || []), tiles = new Set(preview?.tiles || []);
     overlays.forEach((overlay, index) => {
       overlay.target.setEnabled(targets.has(index)); overlay.border.setEnabled(targets.has(index));
@@ -677,7 +483,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     const viewport = camera.viewport.toGlobal(canvas.clientWidth, canvas.clientHeight);
     // WebGL viewports start at the bottom; DOM labels start at the top.
     viewport.y = canvas.clientHeight - viewport.y - viewport.height;
-    return Vector3.Project(position, Matrix.IdentityReadOnly, scene.getTransformMatrix(), viewport);
+    return Vector3.Project(worldPoint(position), Matrix.IdentityReadOnly, scene.getTransformMatrix(), viewport);
   };
   const updateActorLabel = (actor) => {
     const unit = actor.data;
@@ -689,6 +495,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
   };
   const makeActor = (unit) => {
     const isHero = unit.id === 'hero', root = new TransformNode(`actor-${unit.id}`, scene);
+    root.parent = boardRoot;
     const height = isHero ? 1.66 : unit.kind === 'brute' ? 1.65 : unit.kind === 'archer' ? 1.42 : 1.52;
     const tex = isHero ? heroTexture : enemyTexture;
     const tint = isHero ? hex('#ffffff') : unit.kind === 'brute' ? hex('#eed0bc') : unit.kind === 'archer' ? hex('#d1d1e3') : hex('#c4bedf');
@@ -717,8 +524,11 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     Object.assign(leader.style, { position: 'absolute', height: '1px', background: '#e9dbc29c', transformOrigin: '0 50%', pointerEvents: 'none' });
     leader.hidden = true; label.style.zIndex = '1';
     label.append(intent, hpTrack, shield); labelsRoot.append(leader, label); labelElements.add(label); labelElements.add(leader);
-    const actor = { root, sprite, mat, tint, height, label, leader, labelOffset: 0, intent, hpText, hpFill, shield, baseTexture: tex, baseSpritePosition: sprite.position.clone(), data: { ...unit } };
+    const actor = { root, sprite, mat, tint, height, poseHeight: height, poseOffsetX: 0, label, leader, labelOffset: 0, intent, hpText, hpFill, shield, baseTexture: tex, data: { ...unit } };
     actors.set(unit.id, actor); return actor;
+  };
+  const updateActorBillboard = (actor) => {
+    actor.sprite.position.copyFrom(localScreenUp().scale(actor.poseHeight / 2).add(localScreenRight().scale(actor.poseOffsetX)).add(new Vector3(0, TURF_HEIGHT, 0)));
   };
   const sync = (nextState) => {
     if (disposed) return;
@@ -728,11 +538,11 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
       const actor = actors.get(unit.id) || makeActor(unit);
       actor.data = { ...unit }; actor.root.position.copyFrom(coord(unit.tile)); actor.root.scaling.setAll(1);
       actor.sprite.metadata.tileIndex = unit.tile; actor.mat.alpha = 1; actor.mat.emissiveColor.copyFrom(actor.tint);
-      actor.sprite.scaling.setAll(1); actor.sprite.position.copyFrom(actor.baseSpritePosition); actor.mat.diffuseTexture = actor.baseTexture;
+      actor.sprite.scaling.setAll(1); actor.poseHeight = actor.height; actor.poseOffsetX = 0; updateActorBillboard(actor); actor.mat.diffuseTexture = actor.baseTexture;
       actor.root.setEnabled(boardPreviewSize === null && unit.hp > 0); updateActorLabel(actor);
     });
     const threatened = new Set(nextState.enemies.filter((e) => e.hp > 0 && e.intent?.type === 'attack').flatMap((e) => e.intent.tiles || []));
-    overlays.forEach((overlay, i) => { const visible = boardPreviewSize === null && threatened.has(i); overlay.telegraph.setEnabled(visible); overlay.dangerBorder.setEnabled(visible); });
+    overlays.forEach((overlay, i) => { const visible = boardPreviewSize === null && !dropMode && threatened.has(i); overlay.telegraph.setEnabled(visible); overlay.dangerBorder.setEnabled(visible); });
     showTargeting(null);
   };
 
@@ -753,28 +563,28 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     for (let i = 0; i <= 24; i++) {
       const t = i / 24, angle = -Math.PI * 0.8 + t * arc;
       for (const r of [radius, radius - Math.sin(t * Math.PI) * 0.13]) {
-        const point = center.add(screenRight.scale(Math.cos(angle) * r)).add(screenUp.scale(Math.sin(angle) * r));
+        const point = center.add(localScreenRight().scale(Math.cos(angle) * r)).add(localScreenUp().scale(Math.sin(angle) * r));
         p.push(point.x, point.y, point.z);
       }
       if (i < 24) { const a = i * 2; ids.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
     }
     VertexData.ComputeNormals(p, ids, n); Object.assign(data, { positions: p, indices: ids, normals: n }); data.applyToMesh(mesh);
-    mesh.material = effectMaterial('slash-light', color); mesh.isPickable = false; effectMeshes.add(mesh); return mesh;
+    mesh.parent = boardRoot; mesh.material = effectMaterial('slash-light', color); mesh.isPickable = false; effectMeshes.add(mesh); return mesh;
   };
   const beam = (from, to, color, width = 0.045) => {
-    const direction = to.subtract(from).normalize(), side = Vector3.Cross(direction, camera.position.subtract(from)).normalize().scale(width);
+    const direction = to.subtract(from).normalize(), side = Vector3.Cross(direction, localDirection(camera.position).subtract(from)).normalize().scale(width);
     const corners = [from.add(side), from.subtract(side), to.subtract(side), to.add(side)];
     const p = corners.flatMap((v) => [v.x, v.y, v.z]), ids = [0, 1, 2, 0, 2, 3], n = [];
     VertexData.ComputeNormals(p, ids, n);
     const mesh = new Mesh('attack-light-beam', scene), data = new VertexData(); Object.assign(data, { positions: p, indices: ids, normals: n }); data.applyToMesh(mesh);
-    mesh.material = effectMaterial('beam-light', color); mesh.isPickable = false; effectMeshes.add(mesh); return mesh;
+    mesh.parent = boardRoot; mesh.material = effectMaterial('beam-light', color); mesh.isPickable = false; effectMeshes.add(mesh); return mesh;
   };
   const floatingText = (actor, text, color) => {
     const element = document.createElement('span'); element.textContent = text;
     Object.assign(element.style, { position: 'absolute', color, font: '700 24px/1 Georgia,"Malgun Gothic",serif', textShadow: '0 2px 2px #19151c,0 0 10px #19151c', transform: 'translate(-50%,-50%)', pointerEvents: 'none', zIndex: '3', whiteSpace: 'nowrap' });
     labelsRoot.append(element); labelElements.add(element);
-    const anchor = actor.root.position.add(screenUp.scale(actor.height * 0.8)).add(new Vector3(0, TURF_HEIGHT + 0.04, 0));
     void animate(650, (t) => {
+      const anchor = actor.root.position.add(localScreenUp().scale(actor.height * 0.8)).add(new Vector3(0, TURF_HEIGHT + 0.04, 0));
       const point = projected(anchor); element.style.left = `${point.x}px`; element.style.top = `${point.y - (reducedMotion ? 0 : t * 30)}px`;
       element.style.opacity = String(1 - Math.max(0, t - 0.5) * 2);
     }).then(() => { element.remove(); labelElements.delete(element); });
@@ -791,8 +601,9 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     if (event.actorId === 'hero' && heroAttackArt) {
       actor.mat.diffuseTexture = heroAttackArt;
       const attackHeight = actor.height * 0.81;
-      actor.sprite.scaling.set((direction.x < -0.05 ? -1 : 1) * spriteAspect(heroAttackArt) / spriteAspect(actor.baseTexture) * 0.81, 0.81, 1);
-      actor.sprite.position.copyFrom(screenUp.scale(attackHeight / 2).add(new Vector3(direction.x < -0.05 ? -0.20 : 0.20, TURF_HEIGHT, 0)));
+      const facesLeft = Vector3.Dot(direction, localScreenRight()) < -0.05;
+      actor.sprite.scaling.set((facesLeft ? -1 : 1) * spriteAspect(heroAttackArt) / spriteAspect(actor.baseTexture) * 0.81, 0.81, 1);
+      actor.poseHeight = attackHeight; actor.poseOffsetX = facesLeft ? -0.20 : 0.20; updateActorBillboard(actor);
     }
     const effects = event.cardId === 'cross'
       ? (event.tiles || [targetIndex]).map((i) => { const p = coord(i).add(new Vector3(0, TURF_HEIGHT + 0.02, 0)); return beam(p.add(new Vector3(0, 2.1, 0)), p, '#d9c1ff', 0.055); })
@@ -805,12 +616,12 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     await animate(420, (t) => {
       if (!reducedMotion) {
         const lunge = Math.sin(t * Math.PI) * 0.34; actor.root.position.copyFrom(origin.add(direction.scale(lunge)));
-        actor.root.position.y = Math.sin(t * Math.PI) * 0.08;
+        actor.root.position.y = origin.y + Math.sin(t * Math.PI) * 0.08;
       }
       effects.forEach((fx) => { fx.material.alpha = Math.sin(t * Math.PI); }); pulses.forEach((p) => { p.material.alpha = Math.sin(t * Math.PI) * 0.42; });
     });
     actor.root.position.copyFrom(origin);
-    actor.sprite.scaling.setAll(1); actor.sprite.position.copyFrom(actor.baseSpritePosition); actor.mat.diffuseTexture = actor.baseTexture;
+    actor.sprite.scaling.setAll(1); actor.poseHeight = actor.height; actor.poseOffsetX = 0; updateActorBillboard(actor); actor.mat.diffuseTexture = actor.baseTexture;
     [...effects, ...pulses].forEach((mesh) => { mesh.material.dispose(); disposeEffect(mesh); });
   };
   const runEvent = async (event) => {
@@ -839,20 +650,94 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     } else if (event.type === 'death') {
       actor.label.hidden = true;
       actor.mat.transparencyMode = StandardMaterial.MATERIAL_ALPHABLEND;
-      await animate(300, (t) => { actor.mat.alpha = 1 - t; if (!reducedMotion) actor.root.position.y = -t * 0.2; });
+      const deathHeight = actor.root.position.y;
+      await animate(300, (t) => { actor.mat.alpha = 1 - t; if (!reducedMotion) actor.root.position.y = deathHeight - t * 0.2; });
       actor.root.setEnabled(false); actor.mat.transparencyMode = StandardMaterial.MATERIAL_ALPHATEST;
     }
   };
   const playEvents = async (events, nextState) => {
-    if (disposed || busy) return;
+    if (disposed || busy || viewBusy || dropMode) return;
     if (boardPreviewSize !== null) { if (nextState) sync(nextState); return; }
-    busy = true; showTargeting(null);
+    busy = true; notifyViewState(); showTargeting(null);
     try { for (const event of events || []) { if (disposed) break; await runEvent(event); } }
-    finally { busy = false; if (!disposed && nextState) sync(nextState); }
+    finally { busy = false; if (!disposed && nextState) sync(nextState); notifyViewState(); }
+  };
+
+  const getBoardViewState = () => ({
+    rotation: ((Math.round(rotation) % 360) + 360) % 360,
+    dropMode, droppedTiles: activeTerrain().heights.flatMap((height, index) => height < -0.01 ? [index] : []),
+    busy: busy || viewBusy, previewSize: boardPreviewSize,
+  });
+  const notifyViewState = () => { if (!disposed) onViewState?.(getBoardViewState()); };
+  const updateTileHeight = (terrain, index, height) => {
+    terrain.heights[index] = height; terrain.tileRoots[index].position.y = height;
+    if (terrain === battleTerrain) {
+      Object.values(overlays[index]).forEach((mesh) => { mesh.position.y = height; });
+      actors.forEach((actor) => { if (actor.data.tile === index) actor.root.position.y = height; });
+    }
+    const focused = keyboardFocus ?? hovered;
+    if (terrain === activeTerrain() && focused === index) focus.position.copyFrom(viewCoord(index));
+  };
+  const rotateBoard = async (degrees) => {
+    if (disposed || busy || viewBusy) return false;
+    if (!Number.isFinite(degrees)) throw new TypeError('Rotation must be a finite number of degrees.');
+    viewBusy = true; down = null; notifyViewState();
+    const start = rotation;
+    try {
+      await animate(560, (t) => {
+        rotation = start + degrees * ease(t); boardRoot.rotation.y = rotation * Math.PI / 180;
+        resize();
+      });
+      rotation = ((start + degrees) % 360 + 360) % 360; boardRoot.rotation.y = rotation * Math.PI / 180;
+    } finally { viewBusy = false; if (!disposed) { resize(); notifyViewState(); } }
+    return !disposed;
+  };
+  const setTileDropMode = (enabled) => {
+    if (disposed || busy || viewBusy) return false;
+    dropMode = Boolean(enabled); down = null; hovered = null;
+    showTargeting(null); sync(latestState); setFocus(keyboardFocus); notifyViewState();
+    return true;
+  };
+  const toggleTileDrop = async (index) => {
+    if (disposed || busy || viewBusy || !dropMode) return false;
+    const terrain = activeTerrain();
+    if (!Number.isInteger(index) || index < 0 || index >= terrain.heights.length) return false;
+    const start = terrain.heights[index], target = start < -0.01 ? 0 : DROP_HEIGHT;
+    viewBusy = true; down = null; keyboardFocus = index; notifyViewState();
+    try {
+      await animate(460, (t) => { updateTileHeight(terrain, index, start + (target - start) * ease(t)); resize(); });
+      updateTileHeight(terrain, index, target);
+    } finally { viewBusy = false; if (!disposed) { setFocus(index); resize(); notifyViewState(); } }
+    return !disposed;
+  };
+  const resetBoardView = async () => {
+    if (disposed || busy || viewBusy) return false;
+    const terrain = activeTerrain(), heights = [...terrain.heights];
+    const start = rotation > 180 ? rotation - 360 : rotation;
+    viewBusy = true; dropMode = false; down = null; hovered = null; notifyViewState();
+    try {
+      await animate(460, (t) => {
+        const progress = ease(t); rotation = start * (1 - progress); boardRoot.rotation.y = rotation * Math.PI / 180;
+        heights.forEach((height, i) => updateTileHeight(terrain, i, height * (1 - progress))); resize();
+      });
+      rotation = 0; boardRoot.rotation.y = 0;
+      terrain.heights.forEach((_, i) => updateTileHeight(terrain, i, 0));
+    } finally { viewBusy = false; if (!disposed) { sync(latestState); setFocus(keyboardFocus); resize(); notifyViewState(); } }
+    return !disposed;
+  };
+  const moveFocusTile = (index, key) => {
+    const direction = { ArrowLeft: new Vector3(-1, 0, 0), ArrowRight: new Vector3(1, 0, 0), ArrowUp: new Vector3(0, 0, 1), ArrowDown: new Vector3(0, 0, -1) }[key];
+    const size = activeTerrain().size;
+    if (!Number.isInteger(index) || index < 0 || index >= size * size) index = Math.floor(size * size / 2);
+    if (!direction) return index;
+    const local = localDirection(direction);
+    const dx = Math.abs(local.x) >= Math.abs(local.z) ? Math.sign(local.x) : 0;
+    const dr = dx === 0 ? -Math.sign(local.z) : 0;
+    return clamp(Math.floor(index / size) + dr, 0, size - 1) * size + clamp(index % size + dx, 0, size - 1);
   };
 
   const getTileAt = (event) => {
-    if (boardPreviewSize !== null) return null;
+    if (viewBusy || (boardPreviewSize !== null && !dropMode)) return null;
     const rect = canvas.getBoundingClientRect();
     const x = event.clientX - rect.left, y = event.clientY - rect.top;
     const viewport = camera.viewport.toGlobal(canvas.clientWidth, canvas.clientHeight);
@@ -862,17 +747,20 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     return pick?.hit ? pick.pickedMesh.metadata.tileIndex : null;
   };
   const pointerMove = (event) => {
-    if (boardPreviewSize !== null) return;
-    const index = getTileAt(event); if (index !== hovered) { hovered = index; onHover?.(index); }
-    const active = index ?? keyboardFocus; focus.setEnabled(active !== null); if (active !== null) focus.position.copyFrom(coord(active));
-    canvas.style.cursor = index === null || busy ? 'default' : 'pointer';
+    if (viewBusy || (boardPreviewSize !== null && !dropMode)) return;
+    const index = getTileAt(event); if (index !== hovered) { hovered = index; if (!dropMode) onHover?.(index); }
+    const active = index ?? keyboardFocus; focus.setEnabled(active !== null); if (active !== null) focus.position.copyFrom(viewCoord(active));
+    canvas.style.cursor = index === null || busy || viewBusy ? 'default' : 'pointer';
   };
-  const pointerLeave = () => { if (boardPreviewSize !== null) return; hovered = null; onHover?.(null); setFocus(keyboardFocus); };
+  const pointerLeave = () => { hovered = null; if (boardPreviewSize === null && !dropMode && !viewBusy) onHover?.(null); setFocus(keyboardFocus); };
   let down = null;
-  const pointerDown = (event) => { if (boardPreviewSize === null && event.button === 0 && !busy) down = { x: event.clientX, y: event.clientY, index: getTileAt(event) }; };
+  const pointerDown = (event) => { if ((boardPreviewSize === null || dropMode) && event.button === 0 && !busy && !viewBusy) down = { x: event.clientX, y: event.clientY, index: getTileAt(event) }; };
   const pointerUp = (event) => {
-    if (!down || busy || boardPreviewSize !== null) { down = null; return; }
-    const index = getTileAt(event); if (index !== null && index === down.index && Math.hypot(event.clientX - down.x, event.clientY - down.y) < 12) onTileClick?.(index);
+    if (!down || busy || viewBusy || (boardPreviewSize !== null && !dropMode)) { down = null; return; }
+    const index = getTileAt(event);
+    if (index !== null && index === down.index && Math.hypot(event.clientX - down.x, event.clientY - down.y) < 12) {
+      if (dropMode) void toggleTileDrop(index); else onTileClick?.(index);
+    }
     down = null;
   };
   const pointerCancel = () => { down = null; };
@@ -882,14 +770,17 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     if (disposed) return;
     engine.resize(); const width = canvas.clientWidth || 1, height = canvas.clientHeight || 1;
     const mobile = width <= 760, short = height < 600;
+    const dropDepth = -Math.min(0, ...activeTerrain().heights);
+    const yawFit = 1 + (Math.abs(Math.cos(boardRoot.rotation.y)) + Math.abs(Math.sin(boardRoot.rotation.y)) - 1) * 0.85;
     if (boardPreviewSize !== null) {
-      const top = mobile ? (short ? 100 : 145) : 105, bottom = 40;
+      const top = short ? 135 : mobile ? 150 : 140, bottom = 40;
       const usable = Math.max(130, height - top - bottom), aspect = width / usable;
       camera.viewport.x = 0; camera.viewport.width = 1;
       camera.viewport.y = bottom / height; camera.viewport.height = usable / height;
-      camera.setTarget(new Vector3(0, -0.12, 0)); camera.alpha = -Math.PI / 2; camera.beta = 0.94;
+      camera.setTarget(new Vector3(0, -0.12 - dropDepth * 0.30, 0)); camera.alpha = -Math.PI / 2; camera.beta = 0.94;
       const span = boardPreviewSize * STEP, focal = 2 * Math.tan(camera.fov / 2);
-      camera.radius = Math.max(3.8, 1.3 + (span + 0.70) / (focal * aspect), 1.1 + (span * Math.cos(camera.beta) + 1.05) / focal) + (boardPreviewSize - 1) * 0.50;
+      const baseRadius = Math.max(3.8, 1.3 + (span + 0.70) / (focal * aspect), 1.1 + (span * Math.cos(camera.beta) + 1.05) / focal) + (boardPreviewSize - 1) * 0.50;
+      camera.radius = baseRadius * yawFit + dropDepth * 0.95;
       return;
     }
     const top = mobile ? (short ? 95 : 150) : (short ? 80 : 100);
@@ -901,14 +792,17 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     camera.viewport.y = (bottom + soilClearance) / height; camera.viewport.height = usable / height;
     // Long focal length keeps the rear row a little narrower, without diamond rotation.
     const aspect = width / usable;
-    camera.radius = Math.max(mobile ? 12.3 : 10.9, 1.9 + 6.65 / (2 * Math.tan(camera.fov / 2) * aspect));
+    camera.setTarget(new Vector3(0, 0.30 - dropDepth * 0.30, 0)); camera.alpha = -Math.PI / 2; camera.beta = 0.94;
+    camera.radius = Math.max(mobile ? 12.3 : 10.9, 1.9 + 6.65 / (2 * Math.tan(camera.fov / 2) * aspect)) * yawFit + dropDepth * 0.95;
     actors.forEach((actor) => { actor.label.style.width = mobile ? '72px' : '82px'; });
   };
   let savedBattleCamera = null, savedLabelVisibility = '';
   const setBoardPreview = (size) => {
-    if (disposed || busy) return false;
+    if (disposed || busy || viewBusy) return false;
     if (size !== null && (!Number.isInteger(size) || size < 1 || size > 5)) throw new RangeError('Board preview size must be 1 through 5, or null.');
     if (size === boardPreviewSize) return true;
+    rotation = 0; boardRoot.rotation.y = 0; dropMode = false; keyboardFocus = null; hovered = null; down = null;
+    battleTerrain.heights.forEach((_, i) => updateTileHeight(battleTerrain, i, 0));
     if (size === null) {
       previewTerrain?.dispose(); previewTerrain = null; boardPreviewSize = null;
       battleTerrain.root.setEnabled(true);
@@ -917,7 +811,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
         camera.setTarget(savedBattleCamera.target); camera.alpha = savedBattleCamera.alpha; camera.beta = savedBattleCamera.beta;
       }
       effectMeshes.forEach((mesh) => mesh.setEnabled(true));
-      sync(latestState); setFocus(keyboardFocus); resize();
+      sync(latestState); setFocus(keyboardFocus); resize(); notifyViewState();
       return true;
     }
     const nextTerrain = buildTerrain(size, `preview-${size}`);
@@ -931,7 +825,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     overlays.forEach((overlay) => Object.values(overlay).forEach((mesh) => mesh.setEnabled(false)));
     effectMeshes.forEach((mesh) => mesh.setEnabled(false));
     hovered = null; down = null; focus.setEnabled(false); canvas.style.cursor = 'default';
-    resize();
+    resize(); notifyViewState();
     return true;
   };
   const observer = new ResizeObserver(resize); observer.observe(canvas);
@@ -943,13 +837,14 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
       const t = clamp((now - job.started) / job.duration); job.update(t);
       if (t >= 1) { animations.delete(job); job.resolve(); }
     });
+    actors.forEach(updateActorBillboard);
     scene.render();
     if (boardPreviewSize !== null) return;
     const placed = [];
     const visibleActors = [...actors.values()].filter((actor) => {
       if (!actor.root.isEnabled() || actor.label.hidden) { actor.leader.hidden = true; return false; }
       return true;
-    }).map((actor) => ({ actor, p: projected(actor.root.position.add(screenUp.scale(actor.height + 0.09)).add(new Vector3(0, TURF_HEIGHT, 0))) }))
+    }).map((actor) => ({ actor, p: projected(actor.root.position.add(localScreenUp().scale(actor.height + 0.09)).add(new Vector3(0, TURF_HEIGHT, 0))) }))
       .sort((a, b) => a.p.y - b.p.y);
     visibleActors.forEach(({ actor, p }) => {
       if (p.z < 0 || p.z > 1) { actor.label.style.display = 'none'; actor.leader.hidden = true; return; }
@@ -981,6 +876,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
   engine.runRenderLoop(render);
   return {
     sync, showTargeting, setFocus, playEvents, resize, setBoardPreview,
+    rotateBoard, setTileDropMode, toggleTileDrop, resetBoardView, getBoardViewState, moveFocusTile,
     dispose() {
       disposed = true; observer.disconnect(); engine.stopRenderLoop(render);
       previewTerrain?.dispose(); previewTerrain = null;

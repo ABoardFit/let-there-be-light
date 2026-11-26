@@ -1,14 +1,14 @@
 # Grassy block face
 
-Current exposed front: `earth-front-grassy-v4.png`. Edited with the built-in image generation tool on 2026-11-26, from `earth-front-stylized-v3.png`. The upper face now carries short grass and moss instead of woody branching roots. The original generated image is retained at `C:/Users/admin/.codex/generated_images/01a2152d-3aa7-7620-9ec4-583f5c596a40/exec-3f143374-9fbd-4197-8a96-c2b0ed61515a.png`.
+Current stone artwork: `earth-front-grassy-v4.png`. Edited with the built-in image generation tool on 2026-11-26, from `earth-front-stylized-v3.png`. The upper face carries short grass and moss instead of woody branching roots. The original generated image is retained at `C:/Users/admin/.codex/generated_images/01a2152d-3aa7-7620-9ec4-583f5c596a40/exec-3f143374-9fbd-4197-8a96-c2b0ed61515a.png`.
 
 Top grass and side soil are unchanged; see [STYLIZED-ASSETS-V6.md](STYLIZED-ASSETS-V6.md).
 
 The renderer uses the lower soil portion of this image beneath a continuous curved grass surface. The top grass texture follows the rounded nine-slice caps and turns down the block sides; a separate straight fringe strip is not used.
 
-The current renderer preserves the existing stone artwork with a single, non-repeating UV mapping across the exposed front. The world-space colour blend is limited to the grass contact; it fades out before the main stone body so the original clods, cracks and small pebbles remain visible once. Mirrored stone sampling is not used. No new raster image was needed for this correction. The same terrain geometry and materials are used in the 1×1 through 5×5 comparison views.
+The renderer maps the original artwork continuously around four physical side walls. Each block has a closed underside and can rotate with the board or move down independently. Texture coordinates and the grass-contact blend use block-local coordinates, so the artwork stays attached during these transforms. The source strip is not mirrored or repeated within a block; its starting side varies between blocks. No new raster image was needed for this correction. The same geometry and materials are used in battle and the 1×1 through 5×5 comparison views.
 
-The narrower rounded caps now meet as close-set tile seams. Adjacent exposed fronts share their boundary rather than using a separate connector panel. A lower-edge alpha filter removes thin dangling root silhouettes while retaining the broad stone shapes and their original colour; procedural hanging roots are also removed. The irregular grass hem remains intact.
+The narrower rounded caps meet as close-set tile seams, without separate connector panels or front-facing picture planes. The lower silhouette is defined by closed geometry following the broad stone contours, with small dangling points smoothed out. Original stone pixels retain a fixed vertical mapping rather than stretching each column to a common bottom. Transparent source pixels encountered along the solid edge receive nearby original stone colour; alpha does not cut holes in the block. The irregular grass hem remains intact.
 
 ## Exact prompt
 
