@@ -1,3 +1,4 @@
+import { fractureBlock } from './collapse.js';
 import { createNineSliceBlock } from './terrain.js';
 export { createNineSliceBlock, nineSliceAxis } from './terrain.js';
 import { Engine } from '@babylonjs/core/Engines/engine.js';
@@ -331,7 +332,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   contactMaterial.transparencyMode = StandardMaterial.MATERIAL_ALPHABLEND;
   const ringHero = material('hero-ground-light', '#d7bf72', '#7e7041');
   const ringEnemy = material('enemy-ground-light', '#cf7165', '#843d3a');
-  const STEP = 1.16, DROP_HEIGHT = -1.2;
+  const STEP = 1.16;
   const boardRoot = new TransformNode('board-view-transform', scene);
   let boardPreviewSize = null, previewTerrain = null, rotation = 0, dropMode = false, viewBusy = false;
   const flatCoord = (index, size = SIZE) => new Vector3((index % size - (size - 1) / 2) * STEP, 0, ((size - 1) / 2 - Math.floor(index / size)) * STEP);
@@ -344,6 +345,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   const buildTerrain = (boardSize, label) => {
     const root = new TransformNode('terrain-' + label, scene); root.parent = boardRoot;
     const groundTiles = [], tileRoots = [], heights = new Array(boardSize * boardSize).fill(0), details = [];
+    const stages = heights.map(() => 0), damage = heights.map(() => null);
     const scatterMaterials = ['#bcb493', '#969b70', '#64704c'].map((color, i) => {
       const mat = material('turf-fragments-' + label + '-' + i, color); mat.specularColor.set(0, 0, 0); return mat;
     });
@@ -379,8 +381,9 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       });
     }
     return {
-      root, groundTiles, tileRoots, heights, size: boardSize,
+      root, groundTiles, tileRoots, heights, stages, damage, details, size: boardSize,
       dispose() {
+        damage.forEach((item) => item?.dispose());
         const removed = new Set([...groundTiles, ...details]);
         soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter((mesh) => !removed.has(mesh));
         removed.forEach((mesh) => { shadows.removeShadowCaster(mesh, false); glow.removeExcludedMesh(mesh); mesh.dispose(false, false); });
@@ -391,6 +394,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   const battleTerrain = buildTerrain(SIZE, 'battle');
   const { groundTiles } = battleTerrain;
   const activeTerrain = () => previewTerrain || battleTerrain;
+  const isTileAvailable = (index) => Number.isInteger(index) && index >= 0 && index < activeTerrain().stages.length && activeTerrain().stages[index] < 3;
   const coord = (index) => flatCoord(index).add(new Vector3(0, battleTerrain.heights[index] || 0, 0));
   const viewCoord = (index) => flatCoord(index, activeTerrain().size).add(new Vector3(0, activeTerrain().heights[index] || 0, 0));
   const makeOverlayMaterial = (name, color, alpha) => {
@@ -450,14 +454,15 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     if (boardPreviewSize !== null && !dropMode) { focus.setEnabled(false); return; }
     keyboardFocus = Number.isInteger(index) && index >= 0 && index < activeTerrain().size ** 2 ? index : null;
     const active = keyboardFocus ?? hovered;
-    focus.setEnabled(active !== null); if (active !== null) focus.position.copyFrom(viewCoord(active));
+    focus.setEnabled(active !== null && isTileAvailable(active)); if (active !== null) focus.position.copyFrom(viewCoord(active));
   };
   const showTargeting = (preview) => {
     if (boardPreviewSize !== null || dropMode) preview = null;
     const targets = new Set(preview?.targets || []), tiles = new Set(preview?.tiles || []);
     overlays.forEach((overlay, index) => {
-      overlay.target.setEnabled(targets.has(index)); overlay.border.setEnabled(targets.has(index));
-      overlay.preview.setEnabled(tiles.has(index)); overlay.preview.material = preview?.valid === false ? previewBadMat : previewGoodMat;
+      const present = battleTerrain.stages[index] < 2;
+      overlay.target.setEnabled(present && targets.has(index)); overlay.border.setEnabled(present && targets.has(index));
+      overlay.preview.setEnabled(present && tiles.has(index)); overlay.preview.material = preview?.valid === false ? previewBadMat : previewGoodMat;
     });
   };
 
@@ -491,7 +496,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     actor.hpFill.style.width = `${clamp(unit.hp / unit.maxHp) * 100}%`;
     actor.shield.textContent = unit.block > 0 ? `방어 ${unit.block}` : '';
     actor.intent.textContent = unit.id === 'hero' ? '빛의 기사' : unit.intent?.type === 'attack' ? `공격 ${unit.intent.damage}` : '이동';
-    actor.label.hidden = unit.hp <= 0;
+    actor.label.hidden = unit.hp <= 0 || battleTerrain.stages[unit.tile] === 3;
   };
   const makeActor = (unit) => {
     const isHero = unit.id === 'hero', root = new TransformNode(`actor-${unit.id}`, scene);
@@ -539,10 +544,10 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       actor.data = { ...unit }; actor.root.position.copyFrom(coord(unit.tile)); actor.root.scaling.setAll(1);
       actor.sprite.metadata.tileIndex = unit.tile; actor.mat.alpha = 1; actor.mat.emissiveColor.copyFrom(actor.tint);
       actor.sprite.scaling.setAll(1); actor.poseHeight = actor.height; actor.poseOffsetX = 0; updateActorBillboard(actor); actor.mat.diffuseTexture = actor.baseTexture;
-      actor.root.setEnabled(boardPreviewSize === null && unit.hp > 0); updateActorLabel(actor);
+      actor.root.setEnabled(boardPreviewSize === null && unit.hp > 0 && battleTerrain.stages[unit.tile] < 3); updateActorLabel(actor);
     });
     const threatened = new Set(nextState.enemies.filter((e) => e.hp > 0 && e.intent?.type === 'attack').flatMap((e) => e.intent.tiles || []));
-    overlays.forEach((overlay, i) => { const visible = boardPreviewSize === null && !dropMode && threatened.has(i); overlay.telegraph.setEnabled(visible); overlay.dangerBorder.setEnabled(visible); });
+    overlays.forEach((overlay, i) => { const visible = boardPreviewSize === null && !dropMode && battleTerrain.stages[i] < 2 && threatened.has(i); overlay.telegraph.setEnabled(visible); overlay.dangerBorder.setEnabled(visible); });
     showTargeting(null);
   };
 
@@ -656,7 +661,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     }
   };
   const playEvents = async (events, nextState) => {
-    if (disposed || busy || viewBusy || dropMode) return;
+    if (disposed || busy || viewBusy || dropMode || battleTerrain.stages.includes(3)) return;
     if (boardPreviewSize !== null) { if (nextState) sync(nextState); return; }
     busy = true; notifyViewState(); showTargeting(null);
     try { for (const event of events || []) { if (disposed) break; await runEvent(event); } }
@@ -665,7 +670,11 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
 
   const getBoardViewState = () => ({
     rotation: ((Math.round(rotation) % 360) + 360) % 360,
-    dropMode, droppedTiles: activeTerrain().heights.flatMap((height, index) => height < -0.01 ? [index] : []),
+    dropMode, tileStages: [...activeTerrain().stages],
+    crackedTiles: activeTerrain().stages.flatMap((stage, index) => stage === 1 ? [index] : []),
+    collapsedTiles: activeTerrain().stages.flatMap((stage, index) => stage === 2 ? [index] : []),
+    removedTiles: activeTerrain().stages.flatMap((stage, index) => stage === 3 ? [index] : []),
+    droppedTiles: activeTerrain().stages.flatMap((stage, index) => stage >= 2 ? [index] : []),
     busy: busy || viewBusy, previewSize: boardPreviewSize,
   });
   const notifyViewState = () => { if (!disposed) onViewState?.(getBoardViewState()); };
@@ -698,16 +707,75 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     showTargeting(null); sync(latestState); setFocus(keyboardFocus); notifyViewState();
     return true;
   };
+  const crackMaterial = material('fractured-turf-interior', '#261f16');
+  crackMaterial.disableLighting = true; crackMaterial.emissiveColor = hex('#30251a');
+  crackMaterial.backFaceCulling = false;
+  const getDamage = (terrain, index) => {
+    if (terrain.damage[index]) return terrain.damage[index];
+    const damage = fractureBlock(terrain.groundTiles[index]);
+    damage.crack.material = crackMaterial; glow.addExcludedMesh(damage.crack);
+    damage.fragments.forEach(({ mesh }) => { shadows.addShadowCaster(mesh); glow.addExcludedMesh(mesh); soilFill.includedOnlyMeshes.push(mesh); });
+    const dispose = damage.dispose;
+    let damageDisposed = false;
+    damage.dispose = () => {
+      if (damageDisposed) return;
+      damageDisposed = true;
+      const meshes = new Set(damage.fragments.map(({ mesh }) => mesh));
+      soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter((mesh) => !meshes.has(mesh));
+      meshes.forEach((mesh) => { shadows.removeShadowCaster(mesh, false); glow.removeExcludedMesh(mesh); });
+      glow.removeExcludedMesh(damage.crack); dispose();
+    };
+    terrain.damage[index] = damage; return damage;
+  };
+  const resetTerrainDamage = (terrain) => {
+    terrain.damage.forEach((damage, i) => {
+      damage?.dispose(); terrain.damage[i] = null; terrain.stages[i] = 0;
+      terrain.groundTiles[i].setEnabled(true); terrain.tileRoots[i].position.copyFrom(flatCoord(i, terrain.size));
+    });
+    terrain.details.forEach((mesh) => mesh.setEnabled(true));
+  };
   const toggleTileDrop = async (index) => {
     if (disposed || busy || viewBusy || !dropMode) return false;
     const terrain = activeTerrain();
-    if (!Number.isInteger(index) || index < 0 || index >= terrain.heights.length) return false;
-    const start = terrain.heights[index], target = start < -0.01 ? 0 : DROP_HEIGHT;
+    if (!Number.isInteger(index) || index < 0 || index >= terrain.stages.length || terrain.stages[index] === 3) return false;
+    const next = terrain.stages[index] + 1;
     viewBusy = true; down = null; keyboardFocus = index; notifyViewState();
     try {
-      await animate(460, (t) => { updateTileHeight(terrain, index, start + (target - start) * ease(t)); resize(); });
-      updateTileHeight(terrain, index, target);
-    } finally { viewBusy = false; if (!disposed) { setFocus(index); resize(); notifyViewState(); } }
+      // Paint the busy state before the first cut allocates its fragment meshes.
+      await animate(16, () => {});
+      if (disposed) return false;
+      const damage = getDamage(terrain, index), tile = terrain.groundTiles[index];
+      terrain.stages[index] = next;
+      if (next === 1) {
+        damage.crack.visibility = 0;
+        await animate(280, (t) => { damage.crack.visibility = ease(t); });
+      } else if (next === 2) {
+        tile.setEnabled(false); damage.crack.setEnabled(false);
+        terrain.details.filter((mesh) => mesh.parent === terrain.tileRoots[index]).forEach((mesh) => mesh.setEnabled(false));
+        damage.fragments.forEach(({ root }) => root.setEnabled(true));
+        await animate(650, (t) => {
+          const progress = ease(t);
+          damage.fragments.forEach(({ root, base, part }) => {
+            if (part !== 1 && part !== 3) return;
+            root.position.copyFrom(base).addInPlace(new Vector3(.14 * progress, -.62 * progress, (part === 1 ? -.08 : .08) * progress));
+            root.rotation.set((part === 1 ? -.15 : .17) * progress, .08 * progress, -.30 * progress);
+          });
+        });
+      } else {
+        damage.crack.setEnabled(false); sync(latestState); setFocus(null);
+        const starts = damage.fragments.map(({ root }) => ({ position: root.position.clone(), rotation: root.rotation.clone() }));
+        await animate(1000, (t) => {
+          damage.fragments.forEach(({ root, mesh, part }, i) => {
+            const start = starts[i], side = part === 0 || part === 2 ? -1 : part === 4 ? 0 : 1;
+            const fall = Math.max(0, (t - part * .025) / (1 - part * .025));
+            root.position.copyFrom(start.position).addInPlace(new Vector3(side * .38 * fall, .10 * Math.sin(Math.PI * fall) - 3.6 * fall * fall, (part % 2 ? -.22 : .22) * fall));
+            root.rotation.copyFrom(start.rotation).addInPlace(new Vector3((part % 2 ? .8 : -.7) * fall, .45 * fall, side * .8 * fall));
+            mesh.visibility = 1 - clamp((fall - .15) / .70);
+          });
+        });
+        damage.dispose(); terrain.damage[index] = null;
+      }
+    } finally { viewBusy = false; if (!disposed) { sync(latestState); setFocus(index); resize(); notifyViewState(); } }
     return !disposed;
   };
   const resetBoardView = async () => {
@@ -722,6 +790,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       });
       rotation = 0; boardRoot.rotation.y = 0;
       terrain.heights.forEach((_, i) => updateTileHeight(terrain, i, 0));
+      resetTerrainDamage(terrain);
     } finally { viewBusy = false; if (!disposed) { sync(latestState); setFocus(keyboardFocus); resize(); notifyViewState(); } }
     return !disposed;
   };
@@ -743,13 +812,13 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     const viewport = camera.viewport.toGlobal(canvas.clientWidth, canvas.clientHeight);
     const top = canvas.clientHeight - viewport.y - viewport.height;
     if (x < viewport.x || x > viewport.x + viewport.width || y < top || y > top + viewport.height) return null;
-    const pick = scene.pick(x, y, (mesh) => Number.isInteger(mesh.metadata?.tileIndex) && mesh.isEnabled());
+    const pick = scene.pick(x, y, (mesh) => Number.isInteger(mesh.metadata?.tileIndex) && mesh.isEnabled() && isTileAvailable(mesh.metadata.tileIndex));
     return pick?.hit ? pick.pickedMesh.metadata.tileIndex : null;
   };
   const pointerMove = (event) => {
     if (viewBusy || (boardPreviewSize !== null && !dropMode)) return;
     const index = getTileAt(event); if (index !== hovered) { hovered = index; if (!dropMode) onHover?.(index); }
-    const active = index ?? keyboardFocus; focus.setEnabled(active !== null); if (active !== null) focus.position.copyFrom(viewCoord(active));
+    const active = index ?? keyboardFocus; focus.setEnabled(active !== null && isTileAvailable(active)); if (active !== null) focus.position.copyFrom(viewCoord(active));
     canvas.style.cursor = index === null || busy || viewBusy ? 'default' : 'pointer';
   };
   const pointerLeave = () => { hovered = null; if (boardPreviewSize === null && !dropMode && !viewBusy) onHover?.(null); setFocus(keyboardFocus); };
@@ -803,6 +872,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     if (size === boardPreviewSize) return true;
     rotation = 0; boardRoot.rotation.y = 0; dropMode = false; keyboardFocus = null; hovered = null; down = null;
     battleTerrain.heights.forEach((_, i) => updateTileHeight(battleTerrain, i, 0));
+    resetTerrainDamage(battleTerrain);
     if (size === null) {
       previewTerrain?.dispose(); previewTerrain = null; boardPreviewSize = null;
       battleTerrain.root.setEnabled(true);
@@ -876,7 +946,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   engine.runRenderLoop(render);
   return {
     sync, showTargeting, setFocus, playEvents, resize, setBoardPreview,
-    rotateBoard, setTileDropMode, toggleTileDrop, resetBoardView, getBoardViewState, moveFocusTile,
+    rotateBoard, setTileDropMode, toggleTileDrop, resetBoardView, getBoardViewState, moveFocusTile, isTileAvailable,
     dispose() {
       disposed = true; observer.disconnect(); engine.stopRenderLoop(render);
       previewTerrain?.dispose(); previewTerrain = null;

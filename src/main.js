@@ -31,11 +31,11 @@ document.querySelector('#app').innerHTML = `
       ${[1, 2, 3, 4, 5].map(size => `<button type="button" data-board-size="${size}" aria-pressed="false" aria-label="${size} 곱하기 ${size} 블록 배열 미리보기" disabled>${size}×${size}</button>`).join('')}
       <button type="button" id="return-to-battle" aria-pressed="true" aria-label="전투 화면으로 돌아가기" disabled>전투로</button>
     </div>
-    <div class="board-layout-buttons board-view-buttons" role="group" aria-label="전장 회전과 높이">
+    <div class="board-layout-buttons board-view-buttons" role="group" aria-label="전장 회전과 타일 붕괴">
       <button type="button" data-board-rotate="90" aria-label="전장을 시계 방향으로 90도 회전" disabled>90° 회전</button>
       <button type="button" data-board-rotate="180" aria-label="전장을 시계 방향으로 180도 회전" disabled>180° 회전</button>
-      <button type="button" id="tile-drop-mode" aria-pressed="false" aria-describedby="board-view-status" disabled>한 칸 내리기</button>
-      <button type="button" id="reset-board-view" aria-label="전장 회전과 블록 높이를 원위치로" disabled>원위치</button>
+      <button type="button" id="tile-drop-mode" aria-pressed="false" aria-describedby="board-view-status" disabled>타일 붕괴</button>
+      <button type="button" id="reset-board-view" aria-label="회전과 무너진 타일을 모두 원위치로 복원" disabled>원위치</button>
     </div>
     <p id="board-view-status" role="status" aria-live="polite" hidden></p>
     <p id="board-preview-status" class="sr-only" hidden></p>
@@ -53,7 +53,7 @@ document.querySelector('#app').innerHTML = `
     <div class="turn-actions"><button id="end-turn" class="end-turn"><span>턴 종료</span><span class="end-turn-key">E</span></button><div class="pile-counts"><span title="뽑을 카드"><span class="pile-icon" aria-hidden="true"></span>뽑기 <b id="draw-count">7</b></span><span title="버린 카드"><span class="pile-icon discard" aria-hidden="true"></span>버림 <b id="discard-count">0</b></span></div><span id="save-label" class="save-label">자동 저장됨</span></div>
   </footer>
   <p class="sr-only" id="keyboard-help">숫자 1부터 5로 카드 선택, 방향키로 전장 칸 이동, Enter 또는 Space로 사용, Escape 또는 오른쪽 클릭으로 취소, E로 턴 종료. 빛나는 칸은 지정 가능한 위치이며 붉은 칸은 적의 다음 공격 위치입니다.</p>
-  <p class="sr-only" id="board-drop-help">방향키로 칸 이동, Enter 또는 Space로 높이 변경, Escape로 한 칸 내리기 종료.</p>
+  <p class="sr-only" id="board-drop-help">방향키로 칸 이동, Enter 또는 Space로 균열, 반붕괴, 추락을 한 단계씩 진행합니다. Escape로 붕괴 모드 종료. 원위치 버튼으로 모든 타일을 복원합니다.</p>
   <div class="loading-screen" id="loading-screen"><span class="loading-sun">${sun}</span><h2>빛이 있으라</h2><p>구름 너머, 성역으로 향하는 중</p></div>
   <dialog id="restart-dialog" class="battle-dialog compact-dialog"><h2>새 전투를 시작할까요?</h2><p>진행 중인 전투가 초기화됩니다.<br>수호자의 체력과 덱이 다시 채워져요.</p><div class="dialog-actions"><button class="quiet-button" data-close="restart-dialog">계속 싸우기</button><button class="primary-button" id="confirm-restart">새 전투 시작</button></div></dialog>
   <dialog id="outcome-dialog" class="battle-dialog outcome-dialog"><span class="dialog-mark">${sun}</span><p class="outcome-kicker" id="outcome-kicker">성역에 찾아온 새벽</p><h2 id="outcome-title">빛이 있으라</h2><p id="outcome-message"></p><div class="outcome-stats" id="outcome-stats"></div><button class="primary-button" id="play-again">다시 도전하기</button></dialog>
@@ -67,7 +67,7 @@ try {
 } catch { storageAvailable = false; }
 let world, selectedUid = null, hoverTile = null, focusTile = state.hero.tile;
 let busy = false, disposed = false, toastTimer, previewSize = null, viewActionPending = false;
-let boardView = { rotation: 0, dropMode: false, droppedTiles: [], busy: false, previewSize: null };
+let boardView = { rotation: 0, dropMode: false, tileStages: [], crackedTiles: [], collapsedTiles: [], removedTiles: [], busy: false, previewSize: null };
 const canvas = document.querySelector('#world');
 const handRoot = document.querySelector('#card-hand');
 const dialogs = [...document.querySelectorAll('dialog')];
@@ -76,22 +76,24 @@ const battleCanvasLabel = canvas.getAttribute('aria-label');
 const layoutButtons = [...document.querySelectorAll('[data-board-size], #return-to-battle')];
 const viewButtons = [...document.querySelectorAll('[data-board-rotate], #tile-drop-mode, #reset-board-view')];
 const viewBusy = () => viewActionPending || boardView.busy;
-const combatBlocked = () => previewSize !== null || busy || viewBusy() || boardView.dropMode;
+const terrainMissing = () => boardView.removedTiles.length > 0;
+const combatBlocked = () => previewSize !== null || busy || viewBusy() || boardView.dropMode || terrainMissing();
 
 function renderBoardControls() {
   [...layoutButtons, ...viewButtons].forEach(button => { button.disabled = busy || viewBusy() || !world; });
   document.querySelector('.board-layout-controls').setAttribute('aria-busy', String(busy || viewBusy()));
   document.querySelector('#tile-drop-mode').setAttribute('aria-pressed', String(boardView.dropMode));
   const status = document.querySelector('#board-view-status');
-  const details = [previewSize !== null ? `${previewSize}×${previewSize} · ${previewSize ** 2}개 블록` : '', boardView.rotation ? `${boardView.rotation}°` : '', boardView.droppedTiles.length ? `내린 칸 ${boardView.droppedTiles.length}개` : ''].filter(Boolean).join(' · ');
-  status.textContent = viewBusy() ? '전장을 움직이는 중' : boardView.dropMode ? '칸을 눌러 내리기 · 다시 누르면 복원' : details;
+  const damage = [[boardView.crackedTiles, '균열'], [boardView.collapsedTiles, '반붕괴'], [boardView.removedTiles, '추락']].filter(([tiles]) => tiles.length).map(([tiles, label]) => `${label} ${tiles.length}칸`).join(' · ');
+  const details = [previewSize !== null ? `${previewSize}×${previewSize} · ${previewSize ** 2}개 블록` : '', boardView.rotation ? `${boardView.rotation}°` : '', damage].filter(Boolean).join(' · ');
+  status.textContent = viewBusy() ? '전장을 움직이는 중' : boardView.dropMode ? '균열 → 반붕괴 → 추락 · 원위치로 복원' : details;
   status.hidden = !status.textContent;
   canvas.tabIndex = previewSize === null || boardView.dropMode ? 0 : -1;
   canvas.setAttribute('aria-describedby', boardView.dropMode ? 'board-view-status board-drop-help' : previewSize !== null ? 'board-preview-status board-view-status' : 'keyboard-help board-view-status');
   canvas.style.cursor = boardView.dropMode ? 'pointer' : 'default';
 }
 function receiveBoardView(next) {
-  boardView = next;
+  boardView = { ...boardView, ...next };
   if (!disposed) renderHud();
 }
 async function changeBoardView(action) {
@@ -189,7 +191,7 @@ function renderHud() {
 function updateTargeting(tile = hoverTile) {
   const prompt = document.querySelector('#prompt-text'), cancel = document.querySelector('#cancel-card');
   if (previewSize !== null) { world?.showTargeting(null); return; }
-  if (viewBusy() || boardView.dropMode) { world?.showTargeting(null); cancel.hidden = true; prompt.textContent = boardView.dropMode ? '높이를 바꾼 뒤 ‘한 칸 내리기’를 다시 누르면 전투를 이어갑니다' : '전장을 움직이고 있습니다'; return; }
+  if (viewBusy() || boardView.dropMode || terrainMissing()) { world?.showTargeting(null); cancel.hidden = true; prompt.textContent = viewBusy() ? '전장을 움직이고 있습니다' : boardView.dropMode ? '같은 칸을 세 번 누르면 무너집니다 · 원위치로 복원' : '타일이 추락했습니다 · 원위치로 복원하면 전투를 이어갑니다'; return; }
   if (busy) { world?.showTargeting(null); cancel.hidden = true; prompt.textContent = '수호자와 그림자가 행동하고 있습니다'; return; }
   const entry = state.hand.find(card => card.uid === selectedUid);
   cancel.hidden = !entry;
@@ -281,7 +283,7 @@ document.addEventListener('keydown', event => {
     else if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); changeBoardView(() => world.toggleTileDrop(focusTile)); }
     return;
   }
-  if (previewSize !== null || state.phase !== 'player') return;
+  if (previewSize !== null || terrainMissing() || state.phase !== 'player') return;
   if (event.key === 'Escape') { cancelSelection(); return; }
   if (event.key.toLowerCase() === 'e') { event.preventDefault(); finishTurn(); return; }
   if (/^[1-5]$/.test(event.key)) { const card = state.hand[Number(event.key) - 1]; if (card) { event.preventDefault(); selectCard(card.uid, true); } return; }
