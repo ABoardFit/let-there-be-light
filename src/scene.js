@@ -2,7 +2,7 @@ import { Engine } from '@babylonjs/core/Engines/engine.js';
 import { Scene } from '@babylonjs/core/scene.js';
 import { ArcRotateCamera } from '@babylonjs/core/Cameras/arcRotateCamera.js';
 import { Camera } from '@babylonjs/core/Cameras/camera.js';
-import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
+import { Vector3, Matrix } from '@babylonjs/core/Maths/math.vector.js';
 import '@babylonjs/core/Culling/ray.js';
 import { Color3, Color4 } from '@babylonjs/core/Maths/math.color.js';
 import { HemisphericLight } from '@babylonjs/core/Lights/hemisphericLight.js';
@@ -46,7 +46,7 @@ import '@babylonjs/core/Shaders/pass.fragment.js';
 import '@babylonjs/core/Shaders/passCube.fragment.js';
 import '@babylonjs/core/Shaders/postprocess.vertex.js';
 
-const SIZE = 10;
+const SIZE = 5;
 const hex = (value) => Color3.FromHexString(value);
 const clamp = (x, low = 0, high = 1) => Math.max(low, Math.min(high, x));
 
@@ -157,7 +157,7 @@ function beveledTile(scene) {
   for (const [x, z] of outline) { positions.push(x * 0.95, 0.16, z * 0.95); uvs.push(x + 0.5, z + 0.5); }
   for (let i = 1; i < 7; i++) indices.push(0, i, i + 1);
   const topIndexCount = indices.length;
-  for (const [scale, y] of [[0.95, 0.16], [1, 0.125], [1, -0.08], [0.96, -0.13]]) {
+  for (const [scale, y] of [[0.95, 0.16], [1, 0.125], [1, -0.28], [0.96, -0.38]]) {
     for (let j = 0; j <= 8; j++) {
       const [x, z] = outline[j % 8]; positions.push(x * scale, y, z * scale); uvs.push(j / 2, (y + 0.2) * 2);
     }
@@ -201,361 +201,407 @@ function paintPine(ctx, width, height) {
   }
 }
 
-export async function createWorld(canvas, { tiles, onTileClick, onHover, reducedMotion = false }) {
-  const engine = new Engine(canvas, true, { stencil: true, preserveDrawingBuffer: false, powerPreference: 'high-performance' });
+export async function createWorld(canvas, { state, onTileClick, onHover, reducedMotion = false, labelsRoot }) {
+  const engine = new Engine(canvas, true, { alpha: true, stencil: true, preserveDrawingBuffer: false, powerPreference: 'high-performance' });
   engine.setHardwareScalingLevel(1 / Math.min(window.devicePixelRatio || 1, 1.5));
   const scene = new Scene(engine);
-  scene.clearColor = new Color4(0.61, 0.49, 0.62, 1);
-  scene.ambientColor = hex('#bba5b0');
-  scene.imageProcessingConfiguration.contrast = 1.08;
-  scene.imageProcessingConfiguration.exposure = 1.03;
-  const camera = new ArcRotateCamera('island-camera', -Math.PI / 2 + 0.12, 0.70, 23, new Vector3(0, -0.15, 0), scene);
-  camera.mode = Camera.ORTHOGRAPHIC_CAMERA;
-  camera.minZ = 0.1; camera.maxZ = 100;
-  const sky = new Layer('painted-sunset', null, scene, true);
-  sky.texture = texture(scene, 'sunset-clouds', { width: 1024, height: 768 }, paintSky);
-  const ambient = new HemisphericLight('sky-light', new Vector3(-0.2, 1, -0.2), scene);
-  ambient.intensity = 0.7; ambient.diffuse = hex('#f5dfcc'); ambient.groundColor = hex('#635671');
-  const sun = new DirectionalLight('late-afternoon-sun', new Vector3(-0.65, -1.4, -0.7), scene);
-  sun.position = new Vector3(7, 14, 6); sun.diffuse = hex('#ffe1b7'); sun.intensity = 1.15;
-  sun.shadowMinZ = 0.1; sun.shadowMaxZ = 45;
+  scene.clearColor = new Color4(0, 0, 0, 0);
+  scene.ambientColor = hex('#8b8295');
+  scene.imageProcessingConfiguration.contrast = 1.06;
+  scene.imageProcessingConfiguration.exposure = 1.0;
+  const camera = new ArcRotateCamera('battle-camera', -Math.PI / 2, 0.79, 12.6, new Vector3(0, 0.30, 0), scene);
+  camera.mode = Camera.PERSPECTIVE_CAMERA;
+  camera.fov = 0.56; camera.minZ = 0.1; camera.maxZ = 80;
+  const artUrl = (name) => `${import.meta.env.BASE_URL}textures/${name}`;
+  canvas.style.backgroundImage = `linear-gradient(rgba(27,24,39,.45),rgba(35,25,35,.56)), url("${artUrl('sunset-clouds.png')}")`;
+  canvas.style.backgroundSize = 'cover'; canvas.style.backgroundPosition = 'center';
+  const ambient = new HemisphericLight('cloud-light', new Vector3(0, 1, 0), scene);
+  ambient.intensity = 0.65; ambient.diffuse = hex('#e1d6d0'); ambient.groundColor = hex('#4e455a');
+  const sun = new DirectionalLight('sunlight', new Vector3(-0.65, -1.4, -0.7), scene);
+  sun.position = new Vector3(7, 14, 6); sun.diffuse = hex('#ffe1b7'); sun.intensity = 1.1;
+  sun.shadowMinZ = 0.1; sun.shadowMaxZ = 40;
   const shadows = new ShadowGenerator(1024, sun);
   shadows.usePercentageCloserFiltering = true; shadows.filteringQuality = ShadowGenerator.QUALITY_LOW;
-  shadows.bias = 0.002; shadows.normalBias = 0.025; shadows.darkness = 0.2;
-  shadows.getShadowMap().refreshRate = 0;
-  const glow = new GlowLayer('warm-lantern-bloom', scene, { mainTextureFixedSize: 512, blurKernelSize: 32 });
-  glow.intensity = 0.45;
-
+  shadows.bias = 0.002; shadows.normalBias = 0.02; shadows.darkness = 0.25;
+  const glow = new GlowLayer('battle-light', scene, { mainTextureFixedSize: 512, blurKernelSize: 32 });
+  glow.intensity = 0.55;
   const material = (name, color, emission) => {
     const m = new StandardMaterial(name, scene); m.diffuseColor = hex(color);
-    m.specularColor = new Color3(0.06, 0.05, 0.035);
+    m.specularColor.set(0.025, 0.022, 0.018);
     if (emission) m.emissiveColor = hex(emission);
     return m;
   };
-  const groundMaterials = Array.from({ length: 6 }, (_, i) => {
-    const m = material(`moss-${i}`, '#ffffff');
-    const tone = 0.78 + i * 0.044;
-    m.diffuseColor.set(tone * 0.99, tone, tone * 0.95);
-    m.diffuseTexture = texture(scene, `moss-grain-${i}`, 256, (ctx, size) => paintGround(ctx, size, i));
-    return m;
-  });
-  const stone = material('weathered-rock', '#d8bba4');
-  stone.diffuseTexture = texture(scene, 'rock-strata', 256, (ctx, size) => paintGround(ctx, size, 3, true));
-  const darkStone = material('rock-shadow', '#715b65');
-  const moss = material('edge-moss', '#53613a');
-  moss.backFaceCulling = false;
-  const bark = material('cedar-bark', '#6f4930');
-  const foliage = [material('pine-deep', '#294f32'), material('pine-mid', '#456b36'), material('pine-lit', '#698742')];
-  const gold = material('aged-brass', '#c59549'); gold.specularColor = hex('#7b5c39');
-  const ivory = material('shrine-limestone', '#cfba91');
-  const darkMetal = material('lantern-iron', '#554344');
-  const warmGlass = material('lantern-light', '#ffd892', '#ffbe55');
-  const flowerMaterials = [material('flower-cream', '#f6daa3'), material('flower-blush', '#e7a6a5'), material('flower-center', '#cc8d38')];
-  const pebbleMat = material('weathered-pebbles', '#b0a18b');
-  pebbleMat.specularColor.set(0.025, 0.022, 0.018);
-  const tileMaterials = groundMaterials.map((ground, i) => {
-    const m = new MultiMaterial(`grass-and-cut-stone-${i}`, scene);
-    m.subMaterials = [ground, stone]; return m;
-  });
-  const pineMaterial = material('painted-pine', '#ffffff', '#ffffff');
-  pineMaterial.disableLighting = true;
-  pineMaterial.diffuseTexture = texture(scene, 'fallback-pine', { width: 256, height: 384 }, paintPine);
-  pineMaterial.diffuseTexture.hasAlpha = true;
-  pineMaterial.useAlphaFromDiffuseTexture = true;
-  pineMaterial.transparencyMode = StandardMaterial.MATERIAL_ALPHATEST;
-  pineMaterial.alphaCutOff = 0.32; pineMaterial.backFaceCulling = false;
-  const contactMaterial = material('soft-contact-shadow', '#302b20', '#302b20');
-  contactMaterial.disableLighting = true; contactMaterial.alpha = 0.42;
-  contactMaterial.diffuseTexture = texture(scene, 'contact-shadow', 64, (ctx, w, h) => {
-    const gradient = ctx.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, w / 2);
-    gradient.addColorStop(0, '#ffffffcc'); gradient.addColorStop(0.4, '#ffffff66'); gradient.addColorStop(1, '#ffffff00');
-    ctx.fillStyle = gradient; ctx.fillRect(0, 0, w, h);
-  });
-  contactMaterial.diffuseTexture.hasAlpha = true; contactMaterial.useAlphaFromDiffuseTexture = true;
-  contactMaterial.transparencyMode = StandardMaterial.MATERIAL_ALPHABLEND;
   const loadArt = (name, alpha = false) => new Promise((resolve) => {
     let art;
-    art = new Texture(`${import.meta.env.BASE_URL}textures/${name}`, scene, false, true, Texture.TRILINEAR_SAMPLINGMODE,
+    art = new Texture(artUrl(name), scene, false, true, Texture.TRILINEAR_SAMPLINGMODE,
       () => { art.hasAlpha = alpha; art.anisotropicFilteringLevel = 8; resolve(art); },
       () => { art?.dispose(); resolve(null); });
   });
-  const [mossArt, cliffArt, pineArt, skyArt] = await Promise.all([
-    loadArt('moss-ground.png'), loadArt('rock-cliff.png'), loadArt('pine-tree.png', true), loadArt('sunset-clouds.png'),
+  const [mossArt, cliffArt, heroArt, enemyArt, heroAttackArt] = await Promise.all([
+    loadArt('moss-ground.png'), loadArt('rock-cliff.png'), loadArt('hero-knight.png', true), loadArt('shade-enemy.png', true), loadArt('hero-attack.png', true),
   ]);
-  if (mossArt) groundMaterials.forEach((m) => { m.diffuseTexture.dispose(); m.diffuseTexture = mossArt; });
-  if (cliffArt) { stone.diffuseTexture.dispose(); stone.diffuseTexture = cliffArt; darkStone.diffuseTexture = cliffArt; pebbleMat.diffuseTexture = cliffArt; }
-  if (pineArt) { pineMaterial.diffuseTexture.dispose(); pineMaterial.diffuseTexture = pineArt; }
-  if (skyArt) { sky.texture.dispose(); sky.texture = skyArt; }
-  const rng = randomSource(1087);
-  const decorations = new Map();
-  const groundTiles = [];
-  const casterMeshes = new Set();
-  const cast = (mesh) => { shadows.addShadowCaster(mesh); casterMeshes.add(mesh); };
-  const coord = (i) => new Vector3(i % SIZE - 4.5, 0, Math.floor(i / SIZE) - 4.5);
-  const register = (mesh, mat, parent, x = 0, y = 0, z = 0) => {
-    mesh.material = mat; mesh.parent = parent; mesh.position.set(x, y, z); mesh.isPickable = false; return mesh;
-  };
-
-  // The jagged, tapered rock body is one mesh, with a separate moss lip above it.
-  const perimeter = [];
-  for (let x = -5; x < 5; x++) perimeter.push([x, -5]);
-  for (let z = -5; z < 5; z++) perimeter.push([5, z]);
-  for (let x = 5; x > -5; x--) perimeter.push([x, 5]);
-  for (let z = 5; z > -5; z--) perimeter.push([-5, z]);
-  const pos = [], idx = [], uv = [];
-  for (let ring = 0; ring < 4; ring++) {
-    perimeter.forEach(([x, z], i) => {
-      const jitter = ring ? (rng() - 0.5) * 0.42 : 0;
-      const scale = [1, 0.99, 0.90, 0.65][ring];
-      pos.push(x * scale + jitter, [-0.12, -0.65, -1.15, -1.8][ring] - rng() * (ring * 0.13), z * scale + jitter);
-      uv.push(i / 5, ring * 0.7);
-    });
-  }
-  for (let ring = 0; ring < 3; ring++) for (let i = 0; i < 40; i++) {
-    const a = ring * 40 + i, b = ring * 40 + (i + 1) % 40;
-    idx.push(a, a + 40, b + 40, a, b + 40, b);
-  }
-  const body = new Mesh('floating-rock-strata', scene);
-  const bodyData = new VertexData(); const bodyNormals = [];
-  VertexData.ComputeNormals(pos, idx, bodyNormals); Object.assign(bodyData, { positions: pos, indices: idx, normals: bodyNormals, uvs: uv });
-  bodyData.applyToMesh(body); body.convertToFlatShadedMesh(); body.material = stone; body.isPickable = false;
-  const bottom = CreateCylinder('island-heart', { diameterTop: 8, diameterBottom: 3.5, height: 1.35, tessellation: 7 }, scene);
-  bottom.position.y = -1.65; bottom.material = darkStone; bottom.scaling.z = 0.88; bottom.isPickable = false;
-
-  const edgeBits = [];
-  perimeter.forEach(([x, z], i) => {
-    if (i % 2 === 0) {
-      const crag = CreateCylinder(`stone-tooth-${i}`, { diameterTop: 0.78, diameterBottom: 0.25, height: 0.7 + rng() * 0.8, tessellation: 5 }, scene);
-      crag.position.set(x * 0.97, -0.92 - rng() * 0.25, z * 0.97); crag.rotation.y = rng() * 6;
-      crag.material = stone; edgeBits.push(crag);
-    }
+  const stone = material('worn-cut-stone', '#b9a58b');
+  stone.diffuseTexture = cliffArt || texture(scene, 'fallback-stone', 256, (ctx, size) => paintGround(ctx, size, 3, true));
+  const groundMaterials = Array.from({ length: 6 }, (_, i) => {
+    const m = material(`moss-block-${i}`, '#ffffff');
+    const tone = 0.74 + i * 0.038; m.diffuseColor.set(tone, tone, tone * 0.92);
+    m.diffuseTexture = mossArt || texture(scene, `fallback-moss-${i}`, 256, (ctx, size) => paintGround(ctx, size, i));
+    const combined = new MultiMaterial(`ground-and-stone-${i}`, scene);
+    combined.subMaterials = [m, stone]; return combined;
   });
-  const crags = Mesh.MergeMeshes(edgeBits, true, true); if (crags) crags.isPickable = false;
-  // Tapered grass blades form a broken organic edge, without round moss blobs.
-  const grassPositions = [], grassIndices = [], grassColors = [];
-  for (let i = 0; i < 150; i++) {
-    const edge = Math.floor(rng() * 4), edgeAlong = (rng() - 0.5) * 9.7;
-    const edgeAcross = 4.88 + (rng() - 0.5) * 0.12;
-    const x = edge < 2 ? edgeAlong : edgeAcross * (edge === 2 ? 1 : -1);
-    const z = edge < 2 ? edgeAcross * (edge === 0 ? 1 : -1) : edgeAlong;
-    for (let blade = 0; blade < 4; blade++) {
-      const angle = rng() * Math.PI * 2, w = 0.012 + rng() * 0.012, height = 0.06 + rng() * 0.15;
-      const dx = Math.cos(angle) * w, dz = Math.sin(angle) * w;
-      const first = grassPositions.length / 3;
-      grassPositions.push(x - dx, 0.155, z - dz, x + dx, 0.155, z + dz, x + dx * 3, 0.155 + height, z + dz * 3);
-      grassIndices.push(first, first + 1, first + 2);
-      const tint = 0.78 + rng() * 0.25;
-      for (let v = 0; v < 3; v++) grassColors.push(tint, tint, tint * 0.85, 1);
-    }
-  }
-  const grass = new Mesh('living-grass-edge', scene), grassData = new VertexData(), grassNormals = [];
-  VertexData.ComputeNormals(grassPositions, grassIndices, grassNormals);
-  Object.assign(grassData, { positions: grassPositions, indices: grassIndices, normals: grassNormals, colors: grassColors });
-  grassData.applyToMesh(grass); grass.material = moss; grass.isPickable = false;
+  const contactMaterial = material('contact-shadow', '#211f21', '#211f21');
+  contactMaterial.disableLighting = true; contactMaterial.alpha = 0.6;
+  contactMaterial.diffuseTexture = texture(scene, 'contact-falloff', 64, (ctx, w, h) => {
+    const g = ctx.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, w / 2);
+    g.addColorStop(0, '#ffffffdd'); g.addColorStop(0.4, '#ffffff88'); g.addColorStop(1, '#ffffff00');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+  });
+  contactMaterial.diffuseTexture.hasAlpha = true; contactMaterial.useAlphaFromDiffuseTexture = true;
+  contactMaterial.transparencyMode = StandardMaterial.MATERIAL_ALPHABLEND;
+  const ringHero = material('hero-ground-light', '#d7bf72', '#7e7041');
+  const ringEnemy = material('enemy-ground-light', '#cf7165', '#843d3a');
+  const rng = randomSource(481);
+  const STEP = 1.16;
+  const coord = (index) => new Vector3((index % SIZE - 2) * STEP, 0, (2 - Math.floor(index / SIZE)) * STEP);
+  const screenUp = new Vector3(0, Math.sin(camera.beta), Math.cos(camera.beta));
+  const screenRight = new Vector3(1, 0, 0);
 
+  // Twenty-five tactile tiles, kept separate from their beveled rock shoulders.
   const tileTemplate = beveledTile(scene);
-  for (let i = 0; i < 100; i++) {
-    const tile = i === 0 ? tileTemplate : tileTemplate.clone(`ground-${i}`);
-    tile.material = tileMaterials[Math.floor(rng() * 6)]; tile.position = coord(i);
+  const groundTiles = [];
+  for (let i = 0; i < SIZE * SIZE; i++) {
+    const tile = i === 0 ? tileTemplate : tileTemplate.clone(`tile-${i}`);
+    tile.material = groundMaterials[Math.floor(rng() * groundMaterials.length)];
+    tile.position = coord(i); tile.scaling.set(1.10, 1, 1.10);
     tile.rotation.y = Math.floor(rng() * 4) * Math.PI / 2;
     tile.receiveShadows = true; tile.metadata = { tileIndex: i }; groundTiles.push(tile);
   }
-
-  function finishDecoration(root, pieces, index) {
-    const byMaterial = new Map();
-    pieces.forEach((mesh) => {
-      const group = byMaterial.get(mesh.material) || []; group.push(mesh); byMaterial.set(mesh.material, group);
+  const makeOverlayMaterial = (name, color, alpha) => {
+    const m = material(name, color, color); m.disableLighting = true; m.alpha = alpha;
+    m.transparencyMode = StandardMaterial.MATERIAL_ALPHABLEND; m.backFaceCulling = false; return m;
+  };
+  const telegraphMat = makeOverlayMaterial('enemy-intent-tiles', '#cf5b51', 0.28);
+  const targetMat = makeOverlayMaterial('valid-target-tiles', '#69a9d7', 0.13);
+  const previewGoodMat = makeOverlayMaterial('attack-area-tiles', '#ebc46b', 0.36);
+  const previewBadMat = makeOverlayMaterial('invalid-area-tiles', '#d6675d', 0.34);
+  const overlays = Array.from({ length: 25 }, (_, index) => {
+    const make = (name, mat, y) => {
+      const plane = CreatePlane(`${name}-${index}`, { width: 1.08, height: 1.08 }, scene);
+      const p = coord(index); plane.rotation.x = Math.PI / 2; plane.position.set(p.x, y, p.z);
+      plane.material = mat; plane.isPickable = false; plane.setEnabled(false); glow.addExcludedMesh(plane); return plane;
+    };
+    const p = coord(index), d = 0.53;
+    const border = CreateLines(`range-outline-${index}`, { points: [new Vector3(-d, 0.183, -d), new Vector3(d, 0.183, -d), new Vector3(d, 0.183, d), new Vector3(-d, 0.183, d), new Vector3(-d, 0.183, -d)] }, scene);
+    border.position.copyFrom(p); border.color = hex('#9fc5de'); border.alpha = 0.6; border.isPickable = false; border.setEnabled(false);
+    const r = 0.50;
+    const dangerBorder = CreateLines(`danger-outline-${index}`, { points: [new Vector3(-r, 0.184, -r), new Vector3(r, 0.184, -r), new Vector3(r, 0.184, r), new Vector3(-r, 0.184, r), new Vector3(-r, 0.184, -r)] }, scene);
+    dangerBorder.position.copyFrom(p); dangerBorder.color = hex('#ff9782'); dangerBorder.alpha = 1; dangerBorder.isPickable = false; dangerBorder.setEnabled(false);
+    return { telegraph: make('intent', telegraphMat, 0.170), target: make('target', targetMat, 0.173), preview: make('preview', previewGoodMat, 0.176), border, dangerBorder };
+  });
+  const focus = CreateLines('keyboard-pointer-focus', { points: [new Vector3(-0.54, 0.19, -0.54), new Vector3(0.54, 0.19, -0.54), new Vector3(0.54, 0.19, 0.54), new Vector3(-0.54, 0.19, 0.54), new Vector3(-0.54, 0.19, -0.54)] }, scene);
+  focus.color = hex('#fff1c5'); focus.isPickable = false; focus.setEnabled(false);
+  let hovered = null, keyboardFocus = null;
+  const setFocus = (index) => {
+    keyboardFocus = Number.isInteger(index) && index >= 0 && index < 25 ? index : null;
+    const active = keyboardFocus ?? hovered;
+    focus.setEnabled(active !== null); if (active !== null) focus.position.copyFrom(coord(active));
+  };
+  const showTargeting = (preview) => {
+    const targets = new Set(preview?.targets || []), tiles = new Set(preview?.tiles || []);
+    overlays.forEach((overlay, index) => {
+      overlay.target.setEnabled(targets.has(index)); overlay.border.setEnabled(targets.has(index));
+      overlay.preview.setEnabled(tiles.has(index)); overlay.preview.material = preview?.valid === false ? previewBadMat : previewGoodMat;
     });
-    // Merge components by material so a flower bed does not become dozens of draws.
-    byMaterial.forEach((parts) => {
-      parts.forEach((p) => p.computeWorldMatrix(true));
-      const merged = Mesh.MergeMeshes(parts, true, true);
-      if (!merged) return;
-      merged.parent = root; merged.position.set(0, 0, 0);
-      merged.isPickable = true; merged.metadata = { tileIndex: index }; merged.receiveShadows = true; cast(merged);
+  };
+
+  let ownLabelsRoot = false;
+  if (!labelsRoot) {
+    labelsRoot = document.createElement('div'); canvas.parentElement.append(labelsRoot); ownLabelsRoot = true;
+    Object.assign(labelsRoot.style, { position: 'absolute', inset: '0', pointerEvents: 'none', zIndex: '3' });
+  }
+  const actors = new Map(), labelElements = new Set(), effectMeshes = new Set();
+  let latestState = state, disposed = false, busy = false;
+  const fallbackActor = (enemy) => texture(scene, enemy ? 'fallback-enemy' : 'fallback-hero', { width: 256, height: 384 }, (ctx, w, h) => {
+    ctx.clearRect(0, 0, w, h);
+    const body = ctx.createLinearGradient(0, 0, w, h); body.addColorStop(0, enemy ? '#a197bd' : '#eee2b8'); body.addColorStop(1, enemy ? '#241e37' : '#3b4e6e');
+    ctx.fillStyle = enemy ? '#48354d' : '#455f88'; ctx.beginPath(); ctx.moveTo(w * .5, h * .2); ctx.lineTo(w * .1, h * .9); ctx.lineTo(w * .8, h * .93); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = body; ctx.beginPath(); ctx.moveTo(w * .38, h * .3); ctx.lineTo(w * .66, h * .28); ctx.lineTo(w * .73, h * .59); ctx.lineTo(w * .62, h * .67); ctx.lineTo(w * .68, h * .91); ctx.lineTo(w * .54, h * .93); ctx.lineTo(w * .48, h * .68); ctx.lineTo(w * .37, h * .94); ctx.lineTo(w * .24, h * .9); ctx.lineTo(w * .34, h * .58); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(w * .49, h * .22, w * .11, h * .10, -.1, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = enemy ? '#bb9fb0' : '#f1d88f'; ctx.lineWidth = 6; ctx.beginPath(); ctx.moveTo(w * .66, h * .55); ctx.lineTo(w * .89, h * .16); ctx.stroke();
+  });
+  const heroTexture = heroArt || fallbackActor(false), enemyTexture = enemyArt || fallbackActor(true);
+  heroTexture.hasAlpha = true; enemyTexture.hasAlpha = true;
+  const spriteAspect = (tex) => { const s = tex.getSize(); return s.width / s.height; };
+  const projected = (position) => {
+    const viewport = camera.viewport.toGlobal(canvas.clientWidth, canvas.clientHeight);
+    // WebGL viewports start at the bottom; DOM labels start at the top.
+    viewport.y = canvas.clientHeight - viewport.y - viewport.height;
+    return Vector3.Project(position, Matrix.IdentityReadOnly, scene.getTransformMatrix(), viewport);
+  };
+  const updateActorLabel = (actor) => {
+    const unit = actor.data;
+    actor.hpText.textContent = `${Math.max(0, unit.hp)} / ${unit.maxHp}`;
+    actor.hpFill.style.width = `${clamp(unit.hp / unit.maxHp) * 100}%`;
+    actor.shield.textContent = unit.block > 0 ? `방어 ${unit.block}` : '';
+    actor.intent.textContent = unit.id === 'hero' ? '빛의 기사' : unit.intent?.type === 'attack' ? `공격 ${unit.intent.damage}` : '이동';
+    actor.label.hidden = unit.hp <= 0;
+  };
+  const makeActor = (unit) => {
+    const isHero = unit.id === 'hero', root = new TransformNode(`actor-${unit.id}`, scene);
+    const height = isHero ? 1.66 : unit.kind === 'brute' ? 1.65 : unit.kind === 'archer' ? 1.42 : 1.52;
+    const tex = isHero ? heroTexture : enemyTexture;
+    const tint = isHero ? hex('#ffffff') : unit.kind === 'brute' ? hex('#eed0bc') : unit.kind === 'archer' ? hex('#d1d1e3') : hex('#c4bedf');
+    const mat = material(`sprite-${unit.id}`, '#ffffff'); mat.disableLighting = true; mat.emissiveColor = tint.clone();
+    mat.diffuseTexture = tex; mat.useAlphaFromDiffuseTexture = true; mat.transparencyMode = StandardMaterial.MATERIAL_ALPHATEST;
+    mat.alphaCutOff = 0.5; mat.backFaceCulling = false;
+    const sprite = CreatePlane(`unit-${unit.id}`, { width: height * spriteAspect(tex), height }, scene);
+    sprite.parent = root; sprite.material = mat; sprite.billboardMode = Mesh.BILLBOARDMODE_ALL;
+    sprite.position.copyFrom(screenUp.scale(height / 2).add(new Vector3(0, 0.16, 0)));
+    sprite.metadata = { tileIndex: unit.tile, actorId: unit.id }; shadows.addShadowCaster(sprite); glow.addExcludedMesh(sprite);
+    const contact = CreatePlane(`unit-shadow-${unit.id}`, { width: 0.95, height: 0.70 }, scene);
+    contact.parent = root; contact.rotation.x = Math.PI / 2; contact.position.y = 0.168; contact.material = contactMaterial; contact.isPickable = false; glow.addExcludedMesh(contact);
+    const ring = CreateTorus(`unit-ring-${unit.id}`, { diameter: 0.88, thickness: 0.035, tessellation: 32 }, scene);
+    ring.parent = root; ring.position.y = 0.185; ring.material = isHero ? ringHero : ringEnemy; ring.isPickable = false;
+    const label = document.createElement('div'); label.className = 'battle-unit-label';
+    Object.assign(label.style, { position: 'absolute', width: '82px', transform: 'translate(-50%,-100%)', pointerEvents: 'none', textAlign: 'center', color: '#f7edda', font: '12px/1.3 "Malgun Gothic",sans-serif', filter: 'drop-shadow(0 2px 3px #17131bdd)' });
+    label.setAttribute('aria-label', `${unit.name || (isHero ? '빛의 기사' : '그늘')} 체력`);
+    const intent = document.createElement('div');
+    Object.assign(intent.style, { display: 'inline-block', padding: '2px 7px', marginBottom: '3px', borderRadius: '3px', fontSize: '12px', background: isHero ? '#273f51ee' : '#642f33ee', border: `1px solid ${isHero ? '#a5bcc8' : '#bf746b'}88` });
+    const hpTrack = document.createElement('div'); Object.assign(hpTrack.style, { position: 'relative', height: '15px', background: '#261b20e6', border: '1px solid #d6b98599', borderRadius: '2px', overflow: 'hidden' });
+    const hpFill = document.createElement('div'); Object.assign(hpFill.style, { position: 'absolute', inset: '0 auto 0 0', background: isHero ? '#6f9a91' : '#ba5b55' });
+    const hpText = document.createElement('span'); Object.assign(hpText.style, { position: 'relative', fontSize: '11px', lineHeight: '13px', display: 'block' });
+    hpTrack.append(hpFill, hpText);
+    const shield = document.createElement('div'); Object.assign(shield.style, { color: '#a9d5e8', fontSize: '11px', marginTop: '2px' });
+    const leader = document.createElement('div');
+    Object.assign(leader.style, { position: 'absolute', height: '1px', background: '#e9dbc29c', transformOrigin: '0 50%', pointerEvents: 'none' });
+    leader.hidden = true; label.style.zIndex = '1';
+    label.append(intent, hpTrack, shield); labelsRoot.append(leader, label); labelElements.add(label); labelElements.add(leader);
+    const actor = { root, sprite, mat, tint, height, label, leader, labelOffset: 0, intent, hpText, hpFill, shield, baseTexture: tex, baseSpritePosition: sprite.position.clone(), data: { ...unit } };
+    actors.set(unit.id, actor); return actor;
+  };
+  const sync = (nextState) => {
+    if (disposed) return;
+    latestState = nextState;
+    const units = [nextState.hero, ...nextState.enemies];
+    units.forEach((unit) => {
+      const actor = actors.get(unit.id) || makeActor(unit);
+      actor.data = { ...unit }; actor.root.position.copyFrom(coord(unit.tile)); actor.root.scaling.setAll(1);
+      actor.sprite.metadata.tileIndex = unit.tile; actor.mat.alpha = 1; actor.mat.emissiveColor.copyFrom(actor.tint);
+      actor.sprite.scaling.setAll(1); actor.sprite.position.copyFrom(actor.baseSpritePosition); actor.mat.diffuseTexture = actor.baseTexture;
+      actor.root.setEnabled(unit.hp > 0); updateActorLabel(actor);
     });
-    root.position = coord(index); decorations.set(index, root);
-  }
+    const threatened = new Set(nextState.enemies.filter((e) => e.hp > 0 && e.intent?.type === 'attack').flatMap((e) => e.intent.tiles || []));
+    overlays.forEach((overlay, i) => { overlay.telegraph.setEnabled(threatened.has(i)); overlay.dangerBorder.setEnabled(threatened.has(i)); });
+    showTargeting(null);
+  };
 
-  function buildDecoration(index, type) {
-    const old = decorations.get(index);
-    if (old) {
-      old.getChildMeshes().forEach((mesh) => { shadows.removeShadowCaster(mesh); glow.removeExcludedMesh(mesh); casterMeshes.delete(mesh); });
-      old.dispose(false, false); decorations.delete(index);
+  const animations = new Set();
+  const animate = (duration, update) => new Promise((resolve) => {
+    if (disposed) { resolve(); return; }
+    const job = { started: performance.now(), duration: reducedMotion ? Math.min(duration, 140) : duration, update, resolve };
+    animations.add(job);
+  });
+  const ease = (t) => 1 - (1 - t) ** 3;
+  const disposeEffect = (mesh) => { effectMeshes.delete(mesh); if (!mesh.isDisposed()) mesh.dispose(); };
+  const effectMaterial = (name, color, alpha = 1) => {
+    const m = material(name, color, color); m.disableLighting = true; m.alpha = alpha; m.backFaceCulling = false;
+    m.transparencyMode = StandardMaterial.MATERIAL_ALPHABLEND; return m;
+  };
+  const energyArc = (center, color, radius = 0.85, arc = Math.PI * 1.25) => {
+    const mesh = new Mesh('sword-light-arc', scene), data = new VertexData(), p = [], n = [], ids = [];
+    for (let i = 0; i <= 24; i++) {
+      const t = i / 24, angle = -Math.PI * 0.8 + t * arc;
+      for (const r of [radius, radius - Math.sin(t * Math.PI) * 0.13]) {
+        const point = center.add(screenRight.scale(Math.cos(angle) * r)).add(screenUp.scale(Math.sin(angle) * r));
+        p.push(point.x, point.y, point.z);
+      }
+      if (i < 24) { const a = i * 2; ids.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
     }
-    if (type === 'empty') return;
-    const root = new TransformNode(`${type}-${index}`, scene), pieces = [];
-    const r = randomSource(index * 91 + 31);
-    // Pieces are authored in world-local coordinates before being merged into a tile root.
-    const add = (mesh, mat, x, y, z) => { register(mesh, mat, null, x, y, z); pieces.push(mesh); return mesh; };
-    if (type === 'tree') {
-      const height = 1.48 + r() * 0.24;
-      const pine = CreatePlane('needle-pine', { width: height * 1145 / 1374, height }, scene);
-      pine.material = pineMaterial; pine.parent = root;
-      pine.billboardMode = Mesh.BILLBOARDMODE_ALL;
-      // Offset along the camera's up vector: the sprite's bottom stays on its tile.
-      pine.position.set(-Math.cos(camera.alpha) * Math.cos(camera.beta) * height / 2,
-        0.16 + Math.sin(camera.beta) * height / 2, -Math.sin(camera.alpha) * Math.cos(camera.beta) * height / 2);
-      pine.metadata = { tileIndex: index }; cast(pine); glow.addExcludedMesh(pine);
-      const contact = CreatePlane('pine-contact', { width: 0.73, height: 0.58 }, scene);
-      contact.parent = root; contact.rotation.x = Math.PI / 2; contact.position.y = 0.169;
-      contact.material = contactMaterial; contact.isPickable = false; glow.addExcludedMesh(contact);
-      root.position = coord(index); decorations.set(index, root);
-      return;
-    } else if (type === 'flower') {
-      for (let j = 0; j < 5; j++) {
-        const x = (r() - 0.5) * 0.6, z = (r() - 0.5) * 0.6, h = 0.28 + r() * 0.2;
-        add(CreateCylinder('flower-stem', { diameter: 0.026, height: h, tessellation: 4 }, scene), foliage[1], x, 0.16 + h / 2, z);
-        for (let p = 0; p < 5; p++) {
-          const angle = p / 5 * Math.PI * 2;
-          const petal = add(CreateSphere('flower-petal', { diameter: 0.13, segments: 4 }, scene), flowerMaterials[j % 2], x + Math.cos(angle) * 0.07, h + 0.16, z + Math.sin(angle) * 0.07);
-          petal.scaling.set(1, 0.36, 1);
-        }
-        add(CreateSphere('pollen', { diameter: 0.07, segments: 4 }, scene), flowerMaterials[2], x, h + 0.19, z);
-      }
-    } else if (type === 'lantern') {
-      add(CreateCylinder('lamp-foot', { diameterTop: 0.35, diameterBottom: 0.42, height: 0.13, tessellation: 8 }, scene), ivory, 0, 0.21, 0);
-      add(CreateCylinder('lamp-pole', { diameter: 0.07, height: 0.55, tessellation: 6 }, scene), darkMetal, 0, 0.52, 0);
-      add(CreateCylinder('lamp-bowl', { diameterTop: 0.35, diameterBottom: 0.2, height: 0.1, tessellation: 6 }, scene), gold, 0, 0.81, 0);
-      add(CreateCylinder('lamp-flame', { diameterTop: 0.19, diameterBottom: 0.25, height: 0.3, tessellation: 6 }, scene), warmGlass, 0, 0.99, 0);
-      for (let j = 0; j < 4; j++) {
-        const a = j * Math.PI / 2 + Math.PI / 4;
-        add(CreateCylinder('lamp-frame', { diameter: 0.025, height: 0.33, tessellation: 4 }, scene), darkMetal, Math.cos(a) * 0.16, 0.99, Math.sin(a) * 0.16);
-      }
-      add(CreateCylinder('lamp-roof', { diameterTop: 0.08, diameterBottom: 0.43, height: 0.18, tessellation: 6 }, scene), gold, 0, 1.22, 0);
-      add(CreateSphere('lamp-finial', { diameter: 0.08, segments: 6 }, scene), gold, 0, 1.35, 0);
-    } else if (type === 'rock') {
-      for (let j = 0; j < 3; j++) {
-        const boulder = add(CreateSphere('quartz-boulder', { diameter: 0.31 + r() * 0.15, segments: 4 }, scene), j === 0 ? stone : pebbleMat, (r() - 0.5) * 0.45, 0.23 + r() * 0.06, (r() - 0.5) * 0.45);
-        boulder.scaling.set(1.12 + r() * 0.3, 0.65 + r() * 0.35, 0.7 + r() * 0.5);
-        boulder.rotation.set(r(), r(), r()); boulder.convertToFlatShadedMesh();
-      }
-    } else if (type === 'shrine') {
-      for (let j = 0; j < 3; j++) {
-        add(CreateCylinder('altar-step', { diameter: 1.0 - j * 0.18, height: 0.13, tessellation: 8 }, scene), ivory, 0, 0.21 + j * 0.13, 0);
-      }
-      add(CreateCylinder('altar-plinth', { diameterTop: 0.29, diameterBottom: 0.43, height: 0.56, tessellation: 8 }, scene), ivory, 0, 0.77, 0);
-      add(CreateCylinder('altar-cap', { diameterTop: 0.51, diameterBottom: 0.35, height: 0.12, tessellation: 8 }, scene), gold, 0, 1.10, 0);
-      const halo = add(CreateTorus('sun-ring', { diameter: 0.82, thickness: 0.045, tessellation: 32 }, scene), gold, 0, 1.63, 0);
-      halo.rotation.x = Math.PI / 2; halo.rotation.y = -0.3;
-      add(CreateSphere('seed-of-light', { diameter: 0.36, segments: 12 }, scene), warmGlass, 0, 1.63, 0);
-      for (let j = 0; j < 8; j++) {
-        const a = j * Math.PI / 4;
-        const ray = add(CreateBox('sun-ray', { width: 0.055, height: j % 2 ? 0.10 : 0.18, depth: 0.05 }, scene), gold, Math.sin(a) * 0.54, 1.63 + Math.cos(a) * 0.54, 0);
-        ray.rotation.z = -a;
-      }
+    VertexData.ComputeNormals(p, ids, n); Object.assign(data, { positions: p, indices: ids, normals: n }); data.applyToMesh(mesh);
+    mesh.material = effectMaterial('slash-light', color); mesh.isPickable = false; effectMeshes.add(mesh); return mesh;
+  };
+  const beam = (from, to, color, width = 0.045) => {
+    const direction = to.subtract(from).normalize(), side = Vector3.Cross(direction, camera.position.subtract(from)).normalize().scale(width);
+    const corners = [from.add(side), from.subtract(side), to.subtract(side), to.add(side)];
+    const p = corners.flatMap((v) => [v.x, v.y, v.z]), ids = [0, 1, 2, 0, 2, 3], n = [];
+    VertexData.ComputeNormals(p, ids, n);
+    const mesh = new Mesh('attack-light-beam', scene), data = new VertexData(); Object.assign(data, { positions: p, indices: ids, normals: n }); data.applyToMesh(mesh);
+    mesh.material = effectMaterial('beam-light', color); mesh.isPickable = false; effectMeshes.add(mesh); return mesh;
+  };
+  const floatingText = (actor, text, color) => {
+    const element = document.createElement('span'); element.textContent = text;
+    Object.assign(element.style, { position: 'absolute', color, font: '700 24px/1 Georgia,"Malgun Gothic",serif', textShadow: '0 2px 2px #19151c,0 0 10px #19151c', transform: 'translate(-50%,-50%)', pointerEvents: 'none', zIndex: '3', whiteSpace: 'nowrap' });
+    labelsRoot.append(element); labelElements.add(element);
+    const anchor = actor.root.position.add(screenUp.scale(actor.height * 0.8)).add(new Vector3(0, 0.2, 0));
+    void animate(650, (t) => {
+      const point = projected(anchor); element.style.left = `${point.x}px`; element.style.top = `${point.y - (reducedMotion ? 0 : t * 30)}px`;
+      element.style.opacity = String(1 - Math.max(0, t - 0.5) * 2);
+    }).then(() => { element.remove(); labelElements.delete(element); });
+  };
+  const animateAttack = async (event) => {
+    const actor = actors.get(event.actorId); if (!actor || !actor.root.isEnabled()) return;
+    const targetIndex = Number.isInteger(event.to) ? event.to : event.tiles?.[0];
+    if (!Number.isInteger(targetIndex)) return;
+    const origin = actor.root.position.clone(), target = coord(targetIndex), direction = target.subtract(origin); direction.y = 0;
+    if (direction.lengthSquared() > 0.001) direction.normalize();
+    const color = event.actorId === 'hero' ? '#ffe4a3' : '#f18b79';
+    const center = target.add(new Vector3(0, 0.65, 0));
+    const useBeam = /pierce|beam|ray|lance|bolt|arrow|line|radiant/i.test(event.cardId || '') || actor.data.kind === 'archer';
+    if (event.actorId === 'hero' && heroAttackArt) {
+      actor.mat.diffuseTexture = heroAttackArt;
+      const attackHeight = actor.height * 0.81;
+      actor.sprite.scaling.set((direction.x < -0.05 ? -1 : 1) * spriteAspect(heroAttackArt) / spriteAspect(actor.baseTexture) * 0.81, 0.81, 1);
+      actor.sprite.position.copyFrom(screenUp.scale(attackHeight / 2).add(new Vector3(direction.x < -0.05 ? -0.20 : 0.20, 0.16, 0)));
     }
-    finishDecoration(root, pieces, index);
-  }
-  tiles.forEach((tile, index) => buildDecoration(index, tile.type));
-
-  const borderPoints = [new Vector3(-0.46, 0.185, -0.46), new Vector3(0.46, 0.185, -0.46), new Vector3(0.46, 0.185, 0.46), new Vector3(-0.46, 0.185, 0.46), new Vector3(-0.46, 0.185, -0.46)];
-  const focusBorder = CreateLines('selected-ground-outline', { points: borderPoints }, scene);
-  focusBorder.color = hex('#fff0b0'); focusBorder.isPickable = false; focusBorder.setEnabled(false);
-  const highlightMaterial = material('tile-hover', '#ffe6a0', '#6f5422'); highlightMaterial.alpha = 0.18;
-  const focusFill = CreateBox('selected-ground-wash', { width: 0.92, depth: 0.92, height: 0.015 }, scene);
-  focusFill.material = highlightMaterial; focusFill.isPickable = false; focusFill.setEnabled(false);
-  let focused = null, keyboardFocus = null, hovered = null, tool = 'tree';
-  const showFocus = (index) => {
-    focused = Number.isInteger(index) && index >= 0 && index < 100 ? index : null;
-    focusBorder.setEnabled(focused !== null); focusFill.setEnabled(focused !== null);
-    if (focused !== null) {
-      const p = coord(focused); focusBorder.position.copyFrom(p); focusFill.position.set(p.x, 0.181, p.z);
-      focusBorder.color = tool === 'erase' ? hex('#ffb5a1') : hex('#fff0b0');
+    const effects = event.cardId === 'cross'
+      ? (event.tiles || [targetIndex]).map((i) => { const p = coord(i).add(new Vector3(0, 0.25, 0)); return beam(p.add(new Vector3(0, 2.1, 0)), p, '#d9c1ff', 0.055); })
+      : [event.cardId === 'nova' ? energyArc(center, color, 1.18, Math.PI * 2)
+        : useBeam ? beam(origin.add(new Vector3(0, 0.95, 0)), center, color) : energyArc(center, color)];
+    const pulses = (event.tiles || [targetIndex]).filter((i) => Number.isInteger(i) && i >= 0 && i < 25).map((i) => {
+      const pulse = CreatePlane('struck-ground', { width: 1.04, height: 1.04 }, scene);
+      pulse.rotation.x = Math.PI / 2; pulse.position.copyFrom(coord(i)); pulse.position.y = 0.181;
+      pulse.material = effectMaterial('impact-floor', color, 0.4); pulse.isPickable = false; effectMeshes.add(pulse); return pulse;
+    });
+    await animate(420, (t) => {
+      if (!reducedMotion) {
+        const lunge = Math.sin(t * Math.PI) * 0.34; actor.root.position.copyFrom(origin.add(direction.scale(lunge)));
+        actor.root.position.y = Math.sin(t * Math.PI) * 0.08;
+      }
+      effects.forEach((fx) => { fx.material.alpha = Math.sin(t * Math.PI); }); pulses.forEach((p) => { p.material.alpha = Math.sin(t * Math.PI) * 0.42; });
+    });
+    actor.root.position.copyFrom(origin);
+    actor.sprite.scaling.setAll(1); actor.sprite.position.copyFrom(actor.baseSpritePosition); actor.mat.diffuseTexture = actor.baseTexture;
+    [...effects, ...pulses].forEach((mesh) => { mesh.material.dispose(); disposeEffect(mesh); });
+  };
+  const runEvent = async (event) => {
+    if (disposed) return;
+    if (event.type === 'attack') { await animateAttack(event); return; }
+    const actor = actors.get(event.actorId || event.targetId);
+    if (!actor) return;
+    if (event.type === 'move') {
+      const from = actor.root.position.clone(), to = coord(event.to);
+      await animate(360, (t) => { actor.root.position.copyFrom(Vector3.Lerp(from, to, ease(t))); if (!reducedMotion) actor.root.position.y += Math.sin(t * Math.PI) * 0.14; });
+      actor.data.tile = event.to; actor.sprite.metadata.tileIndex = event.to; actor.root.position.copyFrom(to);
+    } else if (event.type === 'hit') {
+      const origin = actor.root.position.clone();
+      actor.data.block = Math.max(0, (actor.data.block || 0) - (event.blocked || 0));
+      actor.data.hp = Math.max(0, actor.data.hp - (event.amount || 0)); updateActorLabel(actor);
+      floatingText(actor, event.amount > 0 ? `−${event.amount}` : `방어 ${event.blocked || 0}`, event.amount > 0 ? '#fff0d2' : '#abdfff');
+      await animate(190, (t) => {
+        if (!reducedMotion) actor.root.position.x = origin.x + Math.sin(t * Math.PI * 5) * 0.09 * (1 - t);
+        actor.mat.emissiveColor.copyFrom(Color3.Lerp(hex('#ff8e72'), actor.tint, t));
+      });
+      actor.root.position.copyFrom(origin); actor.mat.emissiveColor.copyFrom(actor.tint);
+    } else if (event.type === 'block') {
+      actor.data.block += event.amount || 0; updateActorLabel(actor); floatingText(actor, `방어 +${event.amount}`, '#b9e7ff');
+      const fx = energyArc(actor.root.position.add(new Vector3(0, 0.8, 0)), '#a4d9ff', 0.75, Math.PI * 2);
+      await animate(260, (t) => { fx.material.alpha = Math.sin(Math.PI * t); }); fx.material.dispose(); disposeEffect(fx);
+    } else if (event.type === 'death') {
+      actor.label.hidden = true;
+      actor.mat.transparencyMode = StandardMaterial.MATERIAL_ALPHABLEND;
+      await animate(300, (t) => { actor.mat.alpha = 1 - t; if (!reducedMotion) actor.root.position.y = -t * 0.2; });
+      actor.root.setEnabled(false); actor.mat.transparencyMode = StandardMaterial.MATERIAL_ALPHATEST;
     }
   };
+  const playEvents = async (events, nextState) => {
+    if (disposed || busy) return;
+    busy = true; showTargeting(null);
+    try { for (const event of events || []) { if (disposed) break; await runEvent(event); } }
+    finally { busy = false; if (!disposed && nextState) sync(nextState); }
+  };
+
   const getTileAt = (event) => {
     const rect = canvas.getBoundingClientRect();
-    const pick = scene.pick(event.clientX - rect.left, event.clientY - rect.top, (mesh) => Number.isInteger(mesh.metadata?.tileIndex));
+    const x = event.clientX - rect.left, y = event.clientY - rect.top;
+    const viewport = camera.viewport.toGlobal(canvas.clientWidth, canvas.clientHeight);
+    const top = canvas.clientHeight - viewport.y - viewport.height;
+    if (x < viewport.x || x > viewport.x + viewport.width || y < top || y > top + viewport.height) return null;
+    const pick = scene.pick(x, y, (mesh) => Number.isInteger(mesh.metadata?.tileIndex) && mesh.isEnabled());
     return pick?.hit ? pick.pickedMesh.metadata.tileIndex : null;
   };
   const pointerMove = (event) => {
-    const index = getTileAt(event);
-    if (index !== hovered) { hovered = index; onHover?.(index); }
-    showFocus(index ?? keyboardFocus); canvas.style.cursor = index === null ? 'default' : 'pointer';
+    const index = getTileAt(event); if (index !== hovered) { hovered = index; onHover?.(index); }
+    const active = index ?? keyboardFocus; focus.setEnabled(active !== null); if (active !== null) focus.position.copyFrom(coord(active));
+    canvas.style.cursor = index === null || busy ? 'default' : 'pointer';
   };
-  const pointerLeave = () => { hovered = null; onHover?.(null); showFocus(keyboardFocus); };
+  const pointerLeave = () => { hovered = null; onHover?.(null); setFocus(keyboardFocus); };
   let down = null;
-  const pointerDown = (event) => { if (event.button === 0) down = { x: event.clientX, y: event.clientY, index: getTileAt(event) }; };
+  const pointerDown = (event) => { if (event.button === 0 && !busy) down = { x: event.clientX, y: event.clientY, index: getTileAt(event) }; };
   const pointerUp = (event) => {
-    if (!down) return;
-    const index = getTileAt(event);
-    if (index !== null && index === down.index && Math.hypot(event.clientX - down.x, event.clientY - down.y) < 12) onTileClick?.(index);
+    if (!down || busy) { down = null; return; }
+    const index = getTileAt(event); if (index !== null && index === down.index && Math.hypot(event.clientX - down.x, event.clientY - down.y) < 12) onTileClick?.(index);
     down = null;
   };
   const pointerCancel = () => { down = null; };
   canvas.addEventListener('pointermove', pointerMove); canvas.addEventListener('pointerleave', pointerLeave);
   canvas.addEventListener('pointerdown', pointerDown); canvas.addEventListener('pointerup', pointerUp); canvas.addEventListener('pointercancel', pointerCancel);
-
-  const dustMaterial = material('sun-dust', '#fff2bc', '#f5ce74');
-  const moteTemplate = CreateSphere('light-mote-0', { diameter: 0.036, segments: 4 }, scene);
-  moteTemplate.material = dustMaterial; moteTemplate.isPickable = false;
-  const motes = [];
-  for (let i = 0; i < 32; i++) {
-    const mesh = i === 0 ? moteTemplate : moteTemplate.createInstance(`light-mote-${i}`);
-    mesh.isPickable = false;
-    const seed = { x: (rng() - 0.5) * 12, y: 0.5 + rng() * 3.3, z: (rng() - 0.5) * 11, phase: rng() * Math.PI * 2 };
-    mesh.position.set(seed.x, seed.y, seed.z); motes.push({ mesh, ...seed });
-  }
-  let radiance = 0, burst = 0, disposed = false;
   const resize = () => {
     if (disposed) return;
-    engine.resize();
-    const width = canvas.clientWidth || 1, height = canvas.clientHeight || 1, aspect = width / height;
-    let halfHeight = aspect < 0.85 ? 7.2 / aspect : aspect < 1.3 ? 8.5 : 7.2;
-    const tabletSidebar = width > 760 && width <= 1000 && height > 520;
-    const shortLandscape = width >= 761 && height <= 520;
-    if (tabletSidebar) {
-      // Keep every tile outside the sidebar even on tall, narrow tablets.
-      const availableBoardWidth = width - 270;
-      halfHeight = Math.max(halfHeight, height * 11.4 / (2 * availableBoardWidth));
-    }
-    if (shortLandscape) halfHeight = Math.max(halfHeight, 8.4);
-    const halfWidth = halfHeight * aspect;
-    const shiftX = shortLandscape ? 1.7 : tabletSidebar ? -113 * (2 * halfHeight / height) : width > 1000 ? -1.05 : 0;
-    const shiftY = width < 700 ? 0.6 : 0.25;
-    camera.orthoLeft = -halfWidth + shiftX; camera.orthoRight = halfWidth + shiftX;
-    camera.orthoTop = halfHeight + shiftY; camera.orthoBottom = -halfHeight + shiftY;
+    engine.resize(); const width = canvas.clientWidth || 1, height = canvas.clientHeight || 1;
+    const mobile = width <= 760, short = height < 600;
+    const top = mobile ? (short ? 95 : 150) : (short ? 80 : 100);
+    const tablet = width > 760 && width <= 1000 && height >= 600;
+    const bottom = mobile ? (short ? 205 : 280) : tablet ? 300 : (short ? 170 : 245);
+    const usable = Math.max(150, height - top - bottom);
+    camera.viewport.x = 0; camera.viewport.width = 1;
+    camera.viewport.y = bottom / height; camera.viewport.height = usable / height;
+    // Long focal length keeps the rear row a little narrower, without diamond rotation.
+    const aspect = width / usable;
+    camera.radius = Math.max(12.3, 1.9 + 6.65 / (2 * Math.tan(camera.fov / 2) * aspect));
+    actors.forEach((actor) => { actor.label.style.width = mobile ? '72px' : '82px'; });
   };
-  const observer = new ResizeObserver(resize); observer.observe(canvas); resize();
-  const start = performance.now();
+  const observer = new ResizeObserver(resize); observer.observe(canvas);
+  sync(state); resize();
   const render = () => {
-    if (document.hidden || disposed) return;
-    const t = (performance.now() - start) / 1000;
-    if (!reducedMotion) {
-      motes.forEach((m, i) => {
-        m.mesh.position.x = m.x + Math.sin(t * 0.11 + m.phase) * 0.22;
-        m.mesh.position.y = m.y + Math.sin(t * 0.32 + m.phase) * 0.24;
-        const scale = 0.5 + (Math.sin(t * 1.1 + m.phase) + 1) * 0.5 + burst * (i % 3 === 0 ? 2 : 0);
-        m.mesh.scaling.setAll(scale);
-      });
-      burst *= 0.985;
-    }
+    if (disposed || document.hidden) return;
+    const now = performance.now();
+    animations.forEach((job) => {
+      const t = clamp((now - job.started) / job.duration); job.update(t);
+      if (t >= 1) { animations.delete(job); job.resolve(); }
+    });
     scene.render();
+    const placed = [];
+    const visibleActors = [...actors.values()].filter((actor) => {
+      if (!actor.root.isEnabled() || actor.label.hidden) { actor.leader.hidden = true; return false; }
+      return true;
+    }).map((actor) => ({ actor, p: projected(actor.root.position.add(screenUp.scale(actor.height + 0.09)).add(new Vector3(0, 0.16, 0))) }))
+      .sort((a, b) => a.p.y - b.p.y);
+    visibleActors.forEach(({ actor, p }) => {
+      if (p.z < 0 || p.z > 1) { actor.label.style.display = 'none'; actor.leader.hidden = true; return; }
+      actor.label.style.display = '';
+      const width = canvas.clientWidth <= 760 ? 72 : 82, height = actor.label.offsetHeight || 43;
+      let chosen = null;
+      for (const dy of [0, -height - 7]) {
+        for (const dx of [actor.labelOffset, 0, width + 9, -width - 9, 2 * width + 12, -2 * width - 12]) {
+          const x = clamp(p.x + dx, width / 2 + 6, canvas.clientWidth - width / 2 - 6), y = p.y + dy;
+          const box = { left: x - width / 2, right: x + width / 2, top: y - height, bottom: y };
+          const overlaps = placed.some((r) => box.left < r.right + 5 && box.right > r.left - 5 && box.top < r.bottom + 5 && box.bottom > r.top - 5);
+          if (!overlaps) { chosen = { x, y, box }; break; }
+        }
+        if (chosen) break;
+      }
+      chosen ||= { x: p.x, y: p.y, box: { left: p.x - width / 2, right: p.x + width / 2, top: p.y - height, bottom: p.y } };
+      placed.push(chosen.box); actor.labelOffset = chosen.x - p.x;
+      actor.label.style.left = `${chosen.x}px`; actor.label.style.top = `${chosen.y}px`;
+      const offset = chosen.x - p.x;
+      actor.leader.hidden = Math.abs(offset) < 5 && Math.abs(chosen.y - p.y) < 5;
+      if (!actor.leader.hidden) {
+        const endX = chosen.x - Math.sign(offset) * (width / 2 - 3), endY = chosen.y - 5;
+        const dx = endX - p.x, dy = endY - p.y;
+        actor.leader.style.left = `${p.x}px`; actor.leader.style.top = `${p.y}px`;
+        actor.leader.style.width = `${Math.hypot(dx, dy)}px`; actor.leader.style.transform = `rotate(${Math.atan2(dy, dx)}rad)`;
+      }
+    });
   };
   engine.runRenderLoop(render);
-  const refreshShadow = () => shadows.getShadowMap()?.resetRefreshCounter();
-  refreshShadow();
-
   return {
-    updateTile(index, type) {
-      if (!Number.isInteger(index) || index < 0 || index >= 100) return;
-      buildDecoration(index, type); refreshShadow();
-    },
-    setSelectedTool(nextTool) { tool = nextTool; showFocus(focused); },
-    setFocus(index) { keyboardFocus = index; showFocus(index ?? hovered); },
-    setRadiance(value) {
-      radiance = clamp(value);
-      sun.intensity = 1.15 + radiance * 0.22;
-      glow.intensity = 0.45 + radiance * 0.35;
-      warmGlass.emissiveColor = new Color3(1, 0.58 + radiance * 0.1, 0.17 + radiance * 0.08);
-    },
-    celebrate() { burst = reducedMotion ? 0 : 1; },
-    resize,
+    sync, showTargeting, setFocus, playEvents, resize,
     dispose() {
       disposed = true; observer.disconnect(); engine.stopRenderLoop(render);
+      animations.forEach((job) => job.resolve()); animations.clear();
       canvas.removeEventListener('pointermove', pointerMove); canvas.removeEventListener('pointerleave', pointerLeave);
       canvas.removeEventListener('pointerdown', pointerDown); canvas.removeEventListener('pointerup', pointerUp); canvas.removeEventListener('pointercancel', pointerCancel);
+      labelElements.forEach((element) => element.remove()); if (ownLabelsRoot) labelsRoot.remove();
       scene.dispose(); engine.dispose();
     },
   };

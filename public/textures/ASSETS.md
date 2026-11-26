@@ -6,6 +6,28 @@ Created for **빛이 있으라** with the built-in image generation tool on 2026
 - `rock-cliff.png` — 1254 × 1254, vertical earth and rock texture.
 - `pine-tree.png` — 1145 × 1374, transparent tree cutout for a fixed-camera sprite.
 - `sunset-clouds.png` — 1536 × 1024, cloud background.
+- `hero-knight.png` — 1024 × 1536, original dawn knight, transparent ready-pose sprite.
+- `hero-attack.png` — 1717 × 916, matching knight thrust animation pose.
+- `shade-enemy.png` — 1086 × 1448, original purple armored wraith sprite.
+
+The combat characters were also generated with the built-in image generation tool on 2026-11-26. They are original designs, not artwork extracted from the reference games. The three enemy classes share the wraith illustration, with separate labels, rings, and sizes. All character PNGs contain alpha transparency.
+
+## Combat sprite generation
+
+The knight brief specified ivory embroidered cloth, muted teal lining, bronze and gold armor, ash-blond hair, a golden sword, a right-facing three-quarter view, and a slightly elevated miniature camera. The enemy brief specified a left-facing purple armored wraith with a horned hood, magenta eyes, claws, and torn robes.
+
+Final ready-pose edit prompt:
+
+> Edit this original knight game sprite. Preserve the knight's face, costume, sword, ready stance and rightward facing direction. REMOVE ALL brown haze, all glows around the silhouette, all background, all floor and all cast shadows. Keep only the solid character and held sword. Output a clean isolated full-body game character with actual transparent alpha immediately outside the precise silhouette. Add generous empty transparent padding 10% on every side, especially left cloak edge and top of head. The sword's solid golden surface can remain bright but no surrounding halo. Do not add a platform, background color or vignette. No text.
+
+Attack-pose edit prompt:
+
+> Edit the supplied original knight into a matching ATTACK FRAME for the same tactical game sprite. Same identity, face, ivory embroidered cloak, muted teal lining, bronze armor, boots and golden sword, same detailed miniature fantasy rendering, same rightward three-quarter facing and slightly overhead camera. Change only pose: powerful forward lunge toward screen RIGHT, front leg bent, rear leg braced, both arms extending the golden sword horizontally forward in a thrust, cloak trailing left. Entire figure and blade fully in frame with transparent margin. Remove ALL brown background haze and glows; isolate the solid character with exact clean alpha silhouette, no floor, no shadow, no magic effects outside silhouette, no text. Actual transparent background.
+
+Original generated files retained in the local generation archive:
+- Ready pose: `exec-56ecf401-dd57-459b-879f-2f824ee89a86.png`
+- Attack pose: `exec-a73b6d39-4dd7-4e91-a43d-4e5cf37cfeb9.png`
+- Enemy: `exec-418a25c9-a42b-4321-936b-5e0e9e5b1460.png`
 
 ## Generation prompts
 
