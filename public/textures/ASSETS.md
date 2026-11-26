@@ -9,10 +9,24 @@ Created for **빛이 있으라** with the built-in image generation tool on 2026
 - `hero-knight.png` — 1024 × 1536, original dawn knight, transparent ready-pose sprite.
 - `hero-attack.png` — 1717 × 916, matching knight thrust animation pose.
 - `shade-enemy.png` — 1086 × 1448, original purple armored wraith sprite.
+- `dirt-soil.png` — 1254 × 1254, detailed earth, fine roots and mineral grit for irregular island undersides; generated on 2026-11-26.
+- `earth-front.png` — 1536 × 1024, transparent exposed-earth face with crumbling clods, embedded pebbles and roots; generated on 2026-11-26.
 
-The combat characters were also generated with the built-in image generation tool on 2026-11-26. They are original designs, not artwork extracted from the reference games. The three enemy classes share the wraith illustration, with separate labels, rings, and sizes. All character PNGs contain alpha transparency.
+## Exposed earth material
+
+Original generation archive file: `exec-72050b60-c726-4b13-8682-84cb75faafdc.png`. Created with the built-in image generation tool and copied into this project with the original retained.
+
+Prompt:
+
+> Production game texture, one square full-bleed seamless diffuse material for the exposed EARTH SIDES and underside clumps of a miniature floating grass island. Close-up front-on cutaway of dense natural dark chocolate-brown and warm umber soil: fine gritty earth grains, small irregular compacted dirt clods, subtle uneven horizontal sediment bands, scattered embedded tiny pale ochre and grey mineral pebbles, thin branching tan fibrous roots weaving irregularly through the soil. Richly tactile high quality fantasy miniature game realism, moderately stylized natural surface, detailed microstructure, nonuniform soft clumps, weathered crumbly dirt, small crevices. Muted earthy warm brown, no large grey rock wall, no brickwork, no regular squares, no geometric outlines, no grass or plants on top, no ground plane, no isolated object, no transparent margins. The material fills every edge. Entire surface uniformly lit with soft diffuse neutral light, no strong highlights or directional shadows, no ambient sky background. Texture should tile and wrap around irregular 3D soil chunks; do not draw a floating island or a silhouette. No text, letters, labels or watermark.
+
+Exposed front-face sprite original: `exec-61be8088-6ab8-49ef-be54-885d67aa1918.png`, retained in the generation archive. Prompt:
+
+> Create one production game sprite with true transparent alpha: a front-facing exposed EARTH CROSS-SECTION attached beneath a square patch of grass in a high-quality miniature fantasy floating island game. We need ONLY THE VERTICAL FRONT FACE of a natural ripped-up clod of earth, not an entire island, not a top-down texture and not a rectangular block. Wide 3:2 composition. Across the upper edge a very thin uneven fringe of olive moss and fine grass roots; immediately below it organic richly detailed warm brown soil clods, embedded tiny ochre and gray pebbles, cavities, realistic gritty crumbling sediment and many thin branching pale roots. The soil mass has a convincing bulging, irregular front surface, subtle overlapping rounded yet broken dirt clusters, protrusions and crevices. Bottom edge must be jagged and organically broken with attached smaller dirt lumps and dangling roots of different lengths; side edges subtly irregular. No continuous horizontal stripe, no wooden edge, no straight brown border, no stone slab, no clean rectangle, no frame, no platform, no geometric cuboid, no isolated spherical balls, no cartoon low-poly triangles. Photorealistic miniature-game terrain with neutral warm light from upper-left and ample soft frontal fill so brown grain and pebbles are visible, not silhouette dark. Camera directly faces the vertical earth cross section; no ground plane, no sky, no scenery, no cast shadow outside the earth. Entire mass and fine dangling roots fully in frame, generous transparent margin below and at sides. No text or watermark. Background must be genuinely transparent.
 
 ## Combat sprite generation
+
+The combat characters were also generated with the built-in image generation tool on 2026-11-26. They are original designs, not artwork extracted from the reference games. The three enemy classes share the wraith illustration, with separate labels, rings, and sizes. All character PNGs contain alpha transparency.
 
 The knight brief specified ivory embroidered cloth, muted teal lining, bronze and gold armor, ash-blond hair, a golden sword, a right-facing three-quarter view, and a slightly elevated miniature camera. The enemy brief specified a left-facing purple armored wraith with a horned hood, magenta eyes, claws, and torn robes.
 

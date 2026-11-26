@@ -3,8 +3,6 @@ import { freshGame, previewCard, validTargets, playCard, endTurn, parseSave, STO
 import { createWorld } from './scene.js';
 
 const sun = '<svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><circle cx="16" cy="16" r="5" fill="currentColor"/><path d="M16 2v5m0 18v5M2 16h5m18 0h5M6 6l3.5 3.5m13 13L26 26M6 26l3.5-3.5m13-13L26 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
-const shield = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m12 3 8 3v6c0 5-8 9-8 9S4 17 4 12V6l8-3Z" stroke="currentColor" stroke-width="1.5"/><path d="M12 7v9m-4-5h8" stroke="currentColor" stroke-width="1.5"/></svg>';
-const sword = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m7 16 11-13h3v3L10 19M4 13l7 7m-6-2-3 3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const esc = value => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 const art = {
   lance: '<g stroke-linecap="round"><path d="M21 86 104 13" stroke="#edb75f" stroke-width="8" opacity=".2"/><path d="M27 80 101 17" stroke="#fff5bf" stroke-width="3"/><path d="m84 22 25-11-13 24 1-12Z" fill="#fff7d0"/><path d="m23 72 12 13m-19 1 11-11" stroke="#c59a59" stroke-width="4"/><path d="M50 28v11m-5-6h11m20 28v13m-6-7h12" stroke="#ebd4a0" stroke-width="1.5"/><path d="M38 71C62 35 77 54 101 30" stroke="#f2c65f" stroke-width="1" fill="none" opacity=".6"/></g>',
@@ -27,14 +25,11 @@ function diagram(id) {
 document.querySelector('#app').innerHTML = `
 <main class="battle" aria-label="빛이 있으라 전술 카드 전투">
   <canvas id="world" tabindex="0" aria-label="5 곱하기 5 전장. 카드 선택 후 방향키로 칸 이동, Enter로 사용." aria-describedby="keyboard-help"></canvas>
-  <div class="scene-shade" aria-hidden="true"></div><div id="unit-labels" aria-hidden="true"></div>
+  <div class="scene-shade" aria-hidden="true"></div><div id="unit-labels"></div>
   <header class="battle-header">
-    <div class="brand"><span class="brand-sun">${sun}</span><div><h1>빛이 있으라</h1><p>잊힌 성역의 수호자</p></div></div>
     <div class="turn-banner"><span class="turn-ornament" aria-hidden="true"></span><div><span id="turn-count">첫 번째 전투</span><strong id="turn-phase">당신의 차례</strong></div><span class="turn-ornament" aria-hidden="true"></span></div>
-    <div class="header-actions"><button class="round-button" id="sound-button" aria-label="효과음 켜기" aria-pressed="false" title="효과음 켜기"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path class="sound-waves" d="M15 8c3 2 3 6 0 8m3-11c5 4 5 10 0 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path class="sound-cross" d="m16 9 6 6m0-6-6 6" stroke="currentColor" stroke-width="1.5"/></svg></button><button class="round-button" id="help-button" aria-label="전투 방법" title="전투 방법">?</button><button class="text-button" id="restart-button">새 전투</button></div>
+    <div class="header-actions"><button class="text-button" id="restart-button">새 전투</button></div>
   </header>
-  <section class="hero-hud" aria-label="수호자 상태"><div class="hero-crest" aria-hidden="true">${sun}</div><div class="hero-vitals"><div class="hero-name"><span>빛의 수호자</span><span class="hero-armor" title="방어도">${shield}<b id="hero-block">0</b></span></div><div class="hp-track"><span id="hero-hp-fill"></span><span id="hero-hp">36 / 36</span></div></div></section>
-  <aside class="enemy-panel" aria-label="적의 다음 행동"><div class="enemy-panel-title">적의 다음 행동 <span id="enemy-count">3</span></div><div id="enemy-intents"></div><p class="intent-note">붉은 칸은 다음 공격 범위</p></aside>
   <div class="battle-log" id="battle-log" aria-label="최근 전투 기록"></div>
   <div class="target-prompt" id="target-prompt"><span class="prompt-icon">${sun}</span><span id="prompt-text">카드를 고르고, 전장의 칸을 선택하세요</span><button id="cancel-card" hidden aria-label="카드 선택 취소">취소 <kbd>Esc</kbd></button></div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
@@ -45,7 +40,6 @@ document.querySelector('#app').innerHTML = `
   </footer>
   <p class="sr-only" id="keyboard-help">숫자 1부터 5로 카드 선택, 방향키로 전장 칸 이동, Enter 또는 Space로 사용, Escape 또는 오른쪽 클릭으로 취소, E로 턴 종료. 빛나는 칸은 지정 가능한 위치이며 붉은 칸은 적의 다음 공격 위치입니다.</p>
   <div class="loading-screen" id="loading-screen"><span class="loading-sun">${sun}</span><h2>빛이 있으라</h2><p>구름 너머, 성역으로 향하는 중</p></div>
-  <dialog id="help-dialog" class="battle-dialog"><button class="dialog-close" data-close="help-dialog" aria-label="닫기">×</button><span class="dialog-mark">${sun}</span><h2>한 장의 카드, 한 번의 선택</h2><p>5 × 5 전장에서 카드를 사용해<br>그림자들을 물리치세요.</p><div class="help-steps"><p><strong>1. 카드를 선택하세요</strong>왼쪽 위 숫자만큼 에너지를 사용해요. 공격, 이동, 방어를 한 턴 안에 조합할 수 있습니다.</p><p><strong>2. 전장의 칸을 고르세요</strong>빛나는 칸은 지정 가능한 곳입니다. 칸에 커서를 올리면 실제 공격 범위가 보여요. 카드의 작은 격자는 범위 모양을 나타냅니다.</p><p><strong>3. 적의 행동을 살피세요</strong>붉은 칸은 적이 다음에 공격할 곳입니다. 이동해 피하거나 방어를 쌓으세요. 턴 종료를 누르면 적이 행동하고 새 카드를 뽑습니다.</p></div><p class="keyboard-note"><kbd>1</kbd>–<kbd>5</kbd> 카드 · <kbd>방향키</kbd> 칸 이동 · <kbd>Enter</kbd> 사용<br><kbd>Esc</kbd> / 오른쪽 클릭 취소 · <kbd>E</kbd> 턴 종료</p><button class="primary-button" data-close="help-dialog">전장으로 돌아가기</button></dialog>
   <dialog id="restart-dialog" class="battle-dialog compact-dialog"><h2>새 전투를 시작할까요?</h2><p>진행 중인 전투가 초기화됩니다.<br>수호자의 체력과 덱이 다시 채워져요.</p><div class="dialog-actions"><button class="quiet-button" data-close="restart-dialog">계속 싸우기</button><button class="primary-button" id="confirm-restart">새 전투 시작</button></div></dialog>
   <dialog id="outcome-dialog" class="battle-dialog outcome-dialog"><span class="dialog-mark">${sun}</span><p class="outcome-kicker" id="outcome-kicker">성역에 찾아온 새벽</p><h2 id="outcome-title">빛이 있으라</h2><p id="outcome-message"></p><div class="outcome-stats" id="outcome-stats"></div><button class="primary-button" id="play-again">다시 도전하기</button></dialog>
 </main>`;
@@ -57,7 +51,7 @@ try {
   if (raw) { const restored = parseSave(raw); if (restored) state = restored; else invalidSave = true; }
 } catch { storageAvailable = false; }
 let world, selectedUid = null, hoverTile = null, focusTile = state.hero.tile;
-let busy = false, disposed = false, soundEnabled = false, audio, toastTimer;
+let busy = false, disposed = false, toastTimer;
 const canvas = document.querySelector('#world');
 const handRoot = document.querySelector('#card-hand');
 const dialogs = [...document.querySelectorAll('dialog')];
@@ -77,22 +71,6 @@ function save() {
   }
   document.querySelector('#save-label').textContent = storageAvailable ? '자동 저장됨' : '이 브라우저는 저장 불가';
 }
-function tone(kind = 'select') {
-  if (!soundEnabled || !audio) return;
-  if (audio.state === 'suspended') audio.resume().catch(() => {});
-  const now = audio.currentTime;
-  const notes = kind === 'attack' ? [329.63, 493.88, 659.25] : kind === 'victory' ? [523.25, 659.25, 783.99, 1046.5] : kind === 'defeat' ? [293.66, 220, 146.83] : [659.25];
-  notes.forEach((frequency, i) => {
-    const oscillator = audio.createOscillator(), envelope = audio.createGain();
-    oscillator.type = kind === 'attack' ? 'triangle' : 'sine';
-    oscillator.frequency.value = frequency;
-    envelope.gain.setValueAtTime(0, now + i * .09);
-    envelope.gain.linearRampToValueAtTime(.045, now + i * .09 + .018);
-    envelope.gain.exponentialRampToValueAtTime(.001, now + i * .09 + .45);
-    oscillator.connect(envelope).connect(audio.destination);
-    oscillator.start(now + i * .09); oscillator.stop(now + i * .09 + .5);
-  });
-}
 function cardMarkup(entry, index, total) {
   const card = CARDS[entry.cardId];
   const typeName = card.type === 'attack' ? '공격' : card.type === 'move' ? '이동' : '방어';
@@ -110,20 +88,11 @@ function renderHand() {
 function renderHud() {
   document.querySelector('#turn-count').textContent = `${state.turn}번째 턴`;
   document.querySelector('#turn-phase').textContent = busy ? '행동하는 중' : state.phase === 'victory' ? '성역을 지켰습니다' : state.phase === 'defeat' ? '빛이 사그라들었습니다' : '당신의 차례';
-  document.querySelector('#hero-hp').textContent = `${state.hero.hp} / ${state.hero.maxHp}`;
-  document.querySelector('#hero-hp-fill').style.width = `${Math.max(0, state.hero.hp / state.hero.maxHp * 100)}%`;
-  document.querySelector('#hero-block').textContent = state.hero.block;
   document.querySelector('#energy-count').textContent = state.energy;
   document.querySelector('#energy-max').textContent = state.maxEnergy;
   document.querySelector('.energy-orb').classList.toggle('depleted', state.energy === 0);
   document.querySelector('#draw-count').textContent = state.drawPile.length;
   document.querySelector('#discard-count').textContent = state.discardPile.length;
-  const enemies = state.enemies.filter(enemy => enemy.hp > 0);
-  document.querySelector('#enemy-count').textContent = enemies.length;
-  document.querySelector('#enemy-intents').innerHTML = enemies.map(enemy => {
-    const attack = enemy.intent?.type === 'attack';
-    return `<div class="enemy-intent ${attack ? 'will-attack' : 'will-move'}"><span class="intent-symbol">${attack ? sword : '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 12h15m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.5"/></svg>'}</span><div><span class="intent-enemy-name">${esc(enemy.name)}</span><span class="intent-action">${attack ? `공격 <b>${enemy.intent.damage}</b>` : '접근 중'}</span></div><span class="enemy-hp-small">${enemy.hp}<span> / ${enemy.maxHp}</span></span></div>`;
-  }).join('');
   document.querySelector('#battle-log').replaceChildren(...state.log.slice(-2).map(entry => { const line = document.createElement('p'); line.textContent = typeof entry === 'string' ? entry : entry.message ?? ''; return line; }));
   document.querySelector('#end-turn').disabled = busy || state.phase !== 'player' || !world;
   document.querySelector('#restart-button').disabled = busy;
@@ -155,7 +124,6 @@ function selectCard(uid, keyboard = false) {
   selectedUid = selectedUid === uid ? null : uid; hoverTile = null;
   renderHand(); updateTargeting();
   if (keyboard) { canvas.focus({ preventScroll: true }); world.setFocus(focusTile); updateTargeting(focusTile); }
-  tone();
 }
 function cancelSelection() {
   if (busy) return;
@@ -170,13 +138,11 @@ function showOutcome() {
   document.querySelector('#outcome-stats').textContent = `${state.turn}턴 · 남은 체력 ${state.hero.hp} / ${state.hero.maxHp}`;
   document.querySelector('#outcome-dialog').classList.toggle('defeat', !victory);
   if (!document.querySelector('#outcome-dialog').open) document.querySelector('#outcome-dialog').showModal();
-  tone(victory ? 'victory' : 'defeat');
 }
 async function execute(result, enemyTurn = false) {
   if (!result.ok) { announce(result.message || '지금은 사용할 수 없습니다.'); return; }
   busy = true; selectedUid = null; hoverTile = null; renderHud();
   if (enemyTurn) document.querySelector('#turn-phase').textContent = '그림자의 차례';
-  tone('attack');
   try { await world.playEvents(result.events, result.state); }
   catch (error) { console.error('Battle animation failed:', error); announce('전투 효과를 건너뛰고 이어갑니다.'); }
   finally {
@@ -205,20 +171,11 @@ function restart() {
 handRoot.addEventListener('click', event => { const button = event.target.closest('[data-card]'); if (button) selectCard(button.dataset.card); });
 document.querySelector('#cancel-card').addEventListener('click', cancelSelection);
 document.querySelector('#end-turn').addEventListener('click', finishTurn);
-document.querySelector('#help-button').addEventListener('click', () => document.querySelector('#help-dialog').showModal());
 document.querySelector('#restart-button').addEventListener('click', () => { if (!busy) document.querySelector('#restart-dialog').showModal(); });
 document.querySelector('#confirm-restart').addEventListener('click', restart);
 document.querySelector('#play-again').addEventListener('click', restart);
 document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => document.getElementById(button.dataset.close).close()));
 document.querySelector('#outcome-dialog').addEventListener('cancel', event => event.preventDefault());
-document.querySelector('#sound-button').addEventListener('click', async () => {
-  const button = document.querySelector('#sound-button');
-  if (!soundEnabled) {
-    try { const AudioClass = window.AudioContext || window.webkitAudioContext; audio ??= new AudioClass(); await audio.resume(); soundEnabled = true; }
-    catch { announce('이 브라우저에서 효과음을 켤 수 없어요.'); return; }
-  } else soundEnabled = false;
-  button.setAttribute('aria-pressed', soundEnabled); button.setAttribute('aria-label', soundEnabled ? '효과음 끄기' : '효과음 켜기'); button.title = soundEnabled ? '효과음 끄기' : '효과음 켜기'; tone();
-});
 canvas.addEventListener('contextmenu', event => { event.preventDefault(); cancelSelection(); });
 document.addEventListener('keydown', event => {
   if (busy || dialogs.some(dialog => dialog.open) || event.altKey || event.ctrlKey || event.metaKey || state.phase !== 'player') return;
@@ -256,4 +213,4 @@ async function boot() {
 boot();
 window.addEventListener('resize', () => world?.resize());
 window.addEventListener('pagehide', save);
-if (import.meta.hot) import.meta.hot.dispose(() => { disposed = true; clearTimeout(toastTimer); world?.dispose(); audio?.close(); });
+if (import.meta.hot) import.meta.hot.dispose(() => { disposed = true; clearTimeout(toastTimer); world?.dispose(); });

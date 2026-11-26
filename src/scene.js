@@ -149,32 +149,58 @@ function paintGround(ctx, size, variant, rock = false) {
   }
 }
 
-function beveledTile(scene) {
-  const mesh = new Mesh('moss-tile-template', scene);
-  const positions = [], indices = [], uvs = [];
-  const outline = [[-0.455, -0.49], [0.455, -0.49], [0.49, -0.455], [0.49, 0.455],
-    [0.455, 0.49], [-0.455, 0.49], [-0.49, 0.455], [-0.49, -0.455]];
-  for (const [x, z] of outline) { positions.push(x * 0.95, 0.16, z * 0.95); uvs.push(x + 0.5, z + 0.5); }
-  for (let i = 1; i < 7; i++) indices.push(0, i, i + 1);
-  const topIndexCount = indices.length;
-  for (const [scale, y] of [[0.95, 0.16], [1, 0.125], [1, -0.28], [0.96, -0.38]]) {
-    for (let j = 0; j <= 8; j++) {
-      const [x, z] = outline[j % 8]; positions.push(x * scale, y, z * scale); uvs.push(j / 2, (y + 0.2) * 2);
+function beveledTile(scene, seed = 0, frontCutout = false) {
+  const mesh = new Mesh(`living-earth-tile-${seed}`, scene), r = randomSource(701 + seed * 47);
+  const positions = [0, 0.16, 0], indices = [], uvs = [0.5, 0.5], outline = [];
+  const half = 0.495;
+  const edgeSegments = 12, depthSegments = 12;
+  // Only the grass follows a shared grid. The soil below has no horizontal collar or ledge.
+  for (let edge = 0; edge < 4; edge++) for (let step = 0; step < edgeSegments; step++) {
+    const along = -half + step * half * 2 / edgeSegments, tiny = step ? (r() - 0.5) * 0.003 : 0;
+    const [x, z] = edge === 0 ? [along, -half + tiny] : edge === 1 ? [half + tiny, along]
+      : edge === 2 ? [-along, half + tiny] : [-half + tiny, -along];
+    outline.push([x, z, 0.157 + r() * 0.006]);
+  }
+  const n = outline.length;
+  outline.forEach(([x, z, y]) => {
+    positions.push(x, y, z);
+    const [u, v] = seed % 4 === 0 ? [x, z] : seed % 4 === 1 ? [-z, x] : seed % 4 === 2 ? [-x, -z] : [z, -x];
+    uvs.push(u + 0.5, v + 0.5);
+  });
+  for (let i = 0; i < n; i++) indices.push(0, i + 1, (i + 1) % n + 1);
+  const topIndexCount = indices.length, sideStart = positions.length / 3;
+  const totalDepth = (0.78 + r() * 0.20) * (frontCutout ? 0.64 : 1);
+  const clumps = Array.from({ length: 4 }, () => Array.from({ length: 5 }, () => ({
+    u: 0.08 + r() * 0.84, v: 0.16 + r() * 0.70,
+    width: 0.10 + r() * 0.13, height: 0.13 + r() * 0.18,
+    amount: 0.045 + r() * 0.095,
+  })));
+  for (let ring = 0; ring <= depthSegments; ring++) {
+    const t = ring / depthSegments;
+    for (let j = 0; j <= n; j++) {
+      const [x, z, topY] = outline[j % n];
+      const side = Math.floor((j % n) / edgeSegments), u = (j % edgeSegments) / edgeSegments;
+      const edgeBlend = Math.sin(u * Math.PI) ** 0.45;
+      const lobes = clumps[side].reduce((sum, c) => sum + c.amount * Math.exp(-(((u - c.u) / c.width) ** 2) - ((t - c.v) / c.height) ** 2), 0) * edgeBlend;
+      const eroded = (noise(seed * 1.7 + j * 0.32, t * 6.4) - 0.5) * 0.055;
+      const swell = Math.sin(t * Math.PI * 0.8) * 0.065 + (lobes + eroded) * Math.sin(t * Math.PI / 2);
+      const scale = 1 + swell / half;
+      const unevenBase = (noise(seed + j * 0.28, 18.2) - 0.5) * 0.11;
+      positions.push(x * scale, topY - t * (totalDepth + unevenBase), z * scale);
+      uvs.push(j / edgeSegments, t);
     }
   }
-  for (let ring = 0; ring < 3; ring++) {
-    for (let j = 0; j < 8; j++) {
-      const a = 8 + ring * 9 + j, b = a + 1;
-      indices.push(a, b + 9, b, a, a + 9, b + 9);
-    }
+  for (let ring = 0; ring < depthSegments; ring++) for (let j = 0; j < n; j++) {
+    if (frontCutout && j < edgeSegments) continue;
+    const a = sideStart + ring * (n + 1) + j, b = a + 1;
+    indices.push(a, b + n + 1, b, a, a + n + 1, b + n + 1);
   }
   const normals = []; VertexData.ComputeNormals(positions, indices, normals);
   const data = new VertexData(); Object.assign(data, { positions, indices, normals, uvs }); data.applyToMesh(mesh);
-  mesh.convertToFlatShadedMesh();
+  // Shared vertices keep the eroded face smooth; detailed clumps are part of the soil itself.
   mesh.releaseSubMeshes();
-  // Flat shading uses unindexed draws, so both vertex and index ranges must split.
-  new SubMesh(0, 0, topIndexCount, 0, topIndexCount, mesh);
-  new SubMesh(1, topIndexCount, mesh.getTotalVertices() - topIndexCount, topIndexCount, indices.length - topIndexCount, mesh);
+  new SubMesh(0, 0, sideStart, 0, topIndexCount, mesh);
+  new SubMesh(1, sideStart, positions.length / 3 - sideStart, topIndexCount, indices.length - topIndexCount, mesh);
   return mesh;
 }
 
@@ -237,17 +263,23 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
       () => { art.hasAlpha = alpha; art.anisotropicFilteringLevel = 8; resolve(art); },
       () => { art?.dispose(); resolve(null); });
   });
-  const [mossArt, cliffArt, heroArt, enemyArt, heroAttackArt] = await Promise.all([
+  const [mossArt, cliffArt, heroArt, enemyArt, heroAttackArt, soilArt, earthFrontArt] = await Promise.all([
     loadArt('moss-ground.png'), loadArt('rock-cliff.png'), loadArt('hero-knight.png', true), loadArt('shade-enemy.png', true), loadArt('hero-attack.png', true),
+    loadArt('dirt-soil.png'),
+    loadArt('earth-front.png', true),
   ]);
   const stone = material('worn-cut-stone', '#b9a58b');
   stone.diffuseTexture = cliffArt || texture(scene, 'fallback-stone', 256, (ctx, size) => paintGround(ctx, size, 3, true));
+  const topsoil = material('continuous-natural-soil', '#e0d3c0'); topsoil.diffuseTexture = soilArt || stone.diffuseTexture;
+  topsoil.emissiveColor.set(0.25, 0.23, 0.21);
+  const soilFill = new DirectionalLight('front-soil-fill', new Vector3(0.15, -0.20, 1), scene);
+  soilFill.diffuse = hex('#e8dfd1'); soilFill.specular.set(0, 0, 0); soilFill.intensity = 0.44;
   const groundMaterials = Array.from({ length: 6 }, (_, i) => {
     const m = material(`moss-block-${i}`, '#ffffff');
-    const tone = 0.74 + i * 0.038; m.diffuseColor.set(tone, tone, tone * 0.92);
+    const tone = 0.80 + i * 0.022; m.diffuseColor.set(tone, tone, tone * 0.92);
     m.diffuseTexture = mossArt || texture(scene, `fallback-moss-${i}`, 256, (ctx, size) => paintGround(ctx, size, i));
     const combined = new MultiMaterial(`ground-and-stone-${i}`, scene);
-    combined.subMaterials = [m, stone]; return combined;
+    combined.subMaterials = [m, topsoil]; return combined;
   });
   const contactMaterial = material('contact-shadow', '#211f21', '#211f21');
   contactMaterial.disableLighting = true; contactMaterial.alpha = 0.6;
@@ -266,16 +298,112 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
   const screenUp = new Vector3(0, Math.sin(camera.beta), Math.cos(camera.beta));
   const screenRight = new Vector3(1, 0, 0);
 
-  // Twenty-five tactile tiles, kept separate from their beveled rock shoulders.
-  const tileTemplate = beveledTile(scene);
+  // Flush grass surfaces sit on overlapping, independently eroded soil clumps.
   const groundTiles = [];
   for (let i = 0; i < SIZE * SIZE; i++) {
-    const tile = i === 0 ? tileTemplate : tileTemplate.clone(`tile-${i}`);
+    const tile = beveledTile(scene, i, Boolean(earthFrontArt) && Math.floor(i / SIZE) === SIZE - 1);
     tile.material = groundMaterials[Math.floor(rng() * groundMaterials.length)];
-    tile.position = coord(i); tile.scaling.set(1.10, 1, 1.10);
-    tile.rotation.y = Math.floor(rng() * 4) * Math.PI / 2;
-    tile.receiveShadows = true; tile.metadata = { tileIndex: i }; groundTiles.push(tile);
+    tile.position = coord(i); tile.scaling.set(STEP, 1, STEP);
+    tile.receiveShadows = true; tile.metadata = { tileIndex: i }; groundTiles.push(tile); glow.addExcludedMesh(tile);
   }
+  soilFill.includedOnlyMeshes = [...groundTiles];
+  if (earthFrontArt) {
+    const frontMaterial = material('exposed-earth-front-art', '#ffffff', '#d8d4cd');
+    frontMaterial.diffuseTexture = earthFrontArt; frontMaterial.useAlphaFromDiffuseTexture = true;
+    frontMaterial.disableLighting = true; frontMaterial.transparencyMode = StandardMaterial.MATERIAL_ALPHATEST;
+    frontMaterial.alphaCutOff = 0.48; frontMaterial.backFaceCulling = false;
+    for (let col = 0; col < SIZE; col++) {
+      const r = randomSource(519 + col * 71), width = 1.30 + r() * 0.065, height = [0.95, 1.12, 0.92, 1.07, 0.98][col];
+      const centerX = (col - 2) * STEP, top = 0.157;
+      const uvStart = [0, 0.11, 0.04, 0.18, 0.05][col], uvSpan = [0.95, 0.80, 0.91, 0.76, 0.95][col];
+      const uvTop = 0.80 - (col % 3) * 0.015;
+      const positions = [], indices = [], uvs = [], normals = [], across = 14, down = 12;
+      for (let row = 0; row <= down; row++) for (let x = 0; x <= across; x++) {
+        const u = x / across, t = row / down, depth = t;
+        const bulge = Math.sin(depth * Math.PI / 2) * (0.15 + col * 0.007) + Math.sin(u * Math.PI) * Math.sin(t * Math.PI) * 0.035;
+        positions.push(centerX + (u - 0.5) * width, top - t * height, -STEP * 2.5 - bulge - col * 0.002);
+        // Start below the source's grassy fringe: the top is soil, never a bright rim.
+        uvs.push(uvStart + (col % 2 ? 1 - u : u) * uvSpan, (1 - t) * uvTop);
+      }
+      for (let row = 0; row < down; row++) for (let x = 0; x < across; x++) {
+        const a = row * (across + 1) + x, b = a + 1, c = a + across + 1;
+        indices.push(a, c, b, b, c, c + 1);
+      }
+      VertexData.ComputeNormals(positions, indices, normals);
+      const face = new Mesh(`eroded-front-cutout-${col}`, scene), data = new VertexData();
+      Object.assign(data, { positions, indices, normals, uvs }); data.applyToMesh(face);
+      face.material = frontMaterial; face.isPickable = false; glow.addExcludedMesh(face);
+    }
+  }
+  // Fine hanging roots and embedded angular gravel break up the exposed soil silhouette.
+  // They are one mesh per material, and never take part in tile picking.
+  const rootPositions = [], rootIndices = [], rootUvs = [];
+  const gravelPositions = [], gravelIndices = [], gravelUvs = [];
+  const rootMaterial = material('fine-hanging-roots', '#795735');
+  const gravelMaterial = material('embedded-gravel', '#97846a'); gravelMaterial.diffuseTexture = stone.diffuseTexture;
+  const appendRoot = (start, outward, length, thickness, seed) => {
+    const r = randomSource(seed), first = rootPositions.length / 3;
+    const bendX = (r() - 0.5) * 0.12, bendZ = (r() - 0.5) * 0.12;
+    for (let ring = 0; ring < 5; ring++) {
+      const t = ring / 4, radius = thickness * (1 - t * 0.88);
+      const x = start.x + outward.x * t * 0.045 + Math.sin(t * Math.PI) * bendX;
+      const z = start.z + outward.z * t * 0.045 + Math.sin(t * Math.PI) * bendZ;
+      for (let side = 0; side < 3; side++) {
+        const a = side / 3 * Math.PI * 2;
+        rootPositions.push(x + Math.cos(a) * radius, start.y - t * length, z + Math.sin(a) * radius);
+        rootUvs.push(side / 3, t);
+      }
+    }
+    for (let ring = 0; ring < 4; ring++) for (let side = 0; side < 3; side++) {
+      const a = first + ring * 3 + side, b = first + ring * 3 + (side + 1) % 3;
+      rootIndices.push(a, b + 3, b, a, a + 3, b + 3);
+    }
+  };
+  const appendGravel = (center, outward, size, seed) => {
+    const r = randomSource(seed), tangent = new Vector3(outward.z, 0, -outward.x);
+    const corners = [[-size, 0, -size * 0.3], [size * 0.8, size * 0.2, 0], [size * (r() - 0.5), -size * 0.8, size * 0.75], [0, size * 0.7, size * 0.5]]
+      .map(([x, y, z]) => center.add(tangent.scale(x)).add(outward.scale(z)).add(new Vector3(0, y, 0)));
+    const centroid = corners.reduce((sum, p) => sum.add(p), Vector3.Zero()).scale(0.25);
+    const first = gravelPositions.length / 3;
+    corners.forEach((p, i) => { gravelPositions.push(p.x, p.y, p.z); gravelUvs.push(i % 2, Math.floor(i / 2)); });
+    for (const face of [[0, 1, 2], [0, 1, 3], [1, 2, 3], [2, 0, 3]]) {
+      const [a, b, c] = face.map((i) => corners[i]);
+      const normal = Vector3.Cross(c.subtract(a), b.subtract(a));
+      const middle = a.add(b).add(c).scale(1 / 3).subtract(centroid);
+      const ids = Vector3.Dot(normal, middle) >= 0 ? face : [face[0], face[2], face[1]];
+      gravelIndices.push(...ids.map((i) => first + i));
+    }
+  };
+  for (let i = 0; i < 25; i++) {
+    const col = i % SIZE, row = Math.floor(i / SIZE), center = coord(i), directions = [];
+    if (col === 0) directions.push(new Vector3(-1, 0, 0));
+    if (col === 4) directions.push(new Vector3(1, 0, 0));
+    if (row === 0) directions.push(new Vector3(0, 0, 1));
+    if (row === 4 && !earthFrontArt) directions.push(new Vector3(0, 0, -1));
+    directions.forEach((outward, edge) => {
+      const r = randomSource(803 + i * 57 + edge * 29), tangent = new Vector3(outward.z, 0, -outward.x);
+      for (let j = 0; j < 3; j++) {
+        const start = center.add(outward.scale(STEP * 0.50 + 0.10 + r() * 0.075)).add(tangent.scale((r() - 0.5) * STEP * 0.85));
+        start.y = -0.02 - r() * 0.28;
+        const length = 0.40 + r() * 0.34;
+        appendRoot(start, outward, length, 0.008 + r() * 0.009, i * 83 + j * 17 + edge);
+        if (j === 1) appendRoot(start.add(new Vector3(0, -length * 0.40, 0)), outward.add(tangent.scale(0.7)), length * 0.5, 0.006, i * 117 + edge);
+      }
+      for (let j = 0; j < 4; j++) {
+        if (r() > 0.55) continue;
+        const p = center.add(outward.scale(STEP * 0.5 + 0.11 + r() * 0.065)).add(tangent.scale((r() - 0.5) * STEP * 0.85));
+        p.y = -0.10 - r() * 0.57; appendGravel(p, outward, 0.028 + r() * 0.035, i * 111 + j * 37 + edge);
+      }
+    });
+  }
+  const terrainDetail = (name, positions, indices, uvs, mat) => {
+    const mesh = new Mesh(name, scene), data = new VertexData(), normals = [];
+    VertexData.ComputeNormals(positions, indices, normals);
+    Object.assign(data, { positions, indices, normals, uvs }); data.applyToMesh(mesh);
+    mesh.convertToFlatShadedMesh(); mesh.material = mat; mesh.isPickable = false; mesh.receiveShadows = true; glow.addExcludedMesh(mesh); soilFill.includedOnlyMeshes.push(mesh);
+  };
+  terrainDetail('dangling-root-fibers', rootPositions, rootIndices, rootUvs, rootMaterial);
+  terrainDetail('soil-gravel-fragments', gravelPositions, gravelIndices, gravelUvs, gravelMaterial);
   const makeOverlayMaterial = (name, color, alpha) => {
     const m = material(name, color, color); m.disableLighting = true; m.alpha = alpha;
     m.transparencyMode = StandardMaterial.MATERIAL_ALPHABLEND; m.backFaceCulling = false; return m;
@@ -544,7 +672,8 @@ export async function createWorld(canvas, { state, onTileClick, onHover, reduced
     const bottom = mobile ? (short ? 205 : 280) : tablet ? 300 : (short ? 170 : 245);
     const usable = Math.max(150, height - top - bottom);
     camera.viewport.x = 0; camera.viewport.width = 1;
-    camera.viewport.y = bottom / height; camera.viewport.height = usable / height;
+    const soilClearance = height >= 600 ? 45 : 0;
+    camera.viewport.y = (bottom + soilClearance) / height; camera.viewport.height = usable / height;
     // Long focal length keeps the rear row a little narrower, without diamond rotation.
     const aspect = width / usable;
     camera.radius = Math.max(12.3, 1.9 + 6.65 / (2 * Math.tan(camera.fov / 2) * aspect));
