@@ -3,12 +3,14 @@ import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData.js';
 import { SubMesh } from '@babylonjs/core/Meshes/subMesh.js';
 import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
 import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
+import { roundVoxelSolid } from './rounded-solid.js';
 
-// Triangle clipping retains the original turf, cap, stone UVs and custom shader
-// attributes. Newly exposed fracture faces alone receive an interior stone crop.
+// Rounded closed solids remove thin tips before mesh extraction. Original turf
+// and stone attributes are projected onto the outside; cuts use the soil material.
 const dot = (a,b) => a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
 const cross3 = (a,b) => [a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
 const unit = a => { const length=Math.hypot(...a); return a.map(v=>v/length); };
+const sourceSamplers=new WeakMap();
 function planeBasis(plane) {
   const normal=plane.slice(0,3), reference=Math.abs(normal[1])<.85?[0,1,0]:[1,0,0];
   const u=unit(cross3(reference,normal));
@@ -27,165 +29,274 @@ function measure(faces) {
     if(mat===0){const ab=v[1].slice(0,3).map((x,j)=>x-v[0][j]),ac=v[2].slice(0,3).map((x,j)=>x-v[0][j]);topArea+=Math.abs(cross3(ab,ac)[1])*.5;}
     for(const point of v)for(let j=0;j<3;j++){min[j]=Math.min(min[j],point[j]);max[j]=Math.max(max[j],point[j]);}
   }
-  return {volume:Math.abs(volume),center:centroid.map(v=>v/volume),topArea,extent:max.map((v,j)=>v-min[j])};
-}
-function isClosedSolid(faces) {
-  const edges=new Map();
-  for(const {v} of faces){
-    const ab=v[1].slice(0,3).map((x,j)=>x-v[0][j]),ac=v[2].slice(0,3).map((x,j)=>x-v[0][j]);
-    if(Math.hypot(...cross3(ab,ac))<1e-12)return false;
-    for(let i=0;i<3;i++){
-      const a=key(v[i]),b=key(v[(i+1)%3]),id=[a,b].sort().join('|');
-      const edge=edges.get(id)||{count:0,direction:0};edge.count++;edge.direction+=a<b?1:-1;edges.set(id,edge);
-    }
-  }
-  return [...edges.values()].every(edge=>edge.count===2&&edge.direction===0);
+  return {volume:Math.abs(volume),center:centroid.map(v=>v/volume),topArea,min,max,extent:max.map((v,j)=>v-min[j])};
 }
 const key = v => v.slice(0,3).map(x => x.toFixed(7)).join(',');
 const mix = (a,b,t) => a.map((x,i) => x+(b[i]-x)*t);
 const distance = (v,p) => dot(v,p)-p[3];
-function weldPositions(vertices) {
-  const buckets=new Map(), epsilon=2e-7;
-  for(const v of vertices){
-    const cell=v.slice(0,3).map(x=>Math.floor(x/epsilon));let found=null;
-    for(let x=-1;x<=1&&!found;x++)for(let y=-1;y<=1&&!found;y++)for(let z=-1;z<=1&&!found;z++){
-      const list=buckets.get([cell[0]+x,cell[1]+y,cell[2]+z].join(','));
-      found=list?.find(p=>Math.hypot(p[0]-v[0],p[1]-v[1],p[2]-v[2])<epsilon);
-    }
-    if(found){v[0]=found[0];v[1]=found[1];v[2]=found[2];}
-    else{const k=cell.join(',');if(!buckets.has(k))buckets.set(k,[]);buckets.get(k).push(v.slice(0,3));}
-  }
-}
-
-function earClip(loop, plane) {
+function fractureSurface(plane,phase) {
   const [u,v]=planeBasis(plane);
-  const coords = loop.map(point => [dot(point,u),dot(point,v)]);
-  const cross = (a,b,c) => (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]);
-  let area=0; for(let i=0;i<coords.length;i++){const a=coords[i],b=coords[(i+1)%coords.length];area+=a[0]*b[1]-b[0]*a[1];}
-  const ids=loop.map((_,i)=>i); if(area<0)ids.reverse();
-  const result=[];
-  while(ids.length>3){
-    let found=false;
-    const order=ids.map((_,i)=>i).sort((i,j)=>cross(coords[ids[(j+ids.length-1)%ids.length]],coords[ids[j]],coords[ids[(j+1)%ids.length]])-cross(coords[ids[(i+ids.length-1)%ids.length]],coords[ids[i]],coords[ids[(i+1)%ids.length]]));
-    for(const i of order){
-      const a=ids[(i+ids.length-1)%ids.length],b=ids[i],c=ids[(i+1)%ids.length];
-      if(cross(coords[a],coords[b],coords[c])<=1e-12)continue;
-      if(ids.some(j=>j!==a&&j!==b&&j!==c&&cross(coords[a],coords[b],coords[j])>=-1e-12&&cross(coords[b],coords[c],coords[j])>=-1e-12&&cross(coords[c],coords[a],coords[j])>=-1e-12))continue;
-      result.push([loop[a],loop[b],loop[c]]);ids.splice(i,1);found=true;break;
-    }
-    if(!found)break;
-  }
-  if(ids.length===3)result.push(ids.map(i=>loop[i]));
-  return result;
-}
-function cut(triangles, plane, interiorOffset) {
-  let kept=[];const segments=[];
-  for(const face of triangles){
-    // Welding this candidate must not alter an already accepted adjacent shard.
-    const poly=[];const verts=face.v.map(v=>[...v]);
-    for(let i=0;i<3;i++){
-      const a=verts[i],b=verts[(i+1)%3],da=distance(a,plane),db=distance(b,plane);
-      if(da<=1e-9)poly.push(a);
-      if((da < -1e-9&&db > 1e-9)||(da > 1e-9&&db < -1e-9))poly.push(mix(a,b,da/(da-db)));
-    }
-    if(poly.length<3)continue;
-    for(let i=1;i<poly.length-1;i++)kept.push({v:[poly[0],poly[i],poly[i+1]],mat:face.mat,cut:face.cut});
-  }
-  weldPositions(kept.flatMap(face=>face.v));
-  kept=kept.filter(({v})=>{
-    const a=v[0],b=v[1],c=v[2],x=[b[0]-a[0],b[1]-a[1],b[2]-a[2]],y=[c[0]-a[0],c[1]-a[1],c[2]-a[2]];
-    return Math.hypot(x[1]*y[2]-x[2]*y[1],x[2]*y[0]-x[0]*y[2],x[0]*y[1]-x[1]*y[0])>1e-13;
-  });
-  const boundary=new Map();
-  for(const {v} of kept)for(let i=0;i<3;i++){
-    const a=v[i],b=v[(i+1)%3],ka=key(a),kb=key(b);if(ka===kb)continue;
-    const k=[ka,kb].sort().join('|');if(boundary.has(k))boundary.get(k).count++;else boundary.set(k,{a,b,count:1});
-  }
-  segments.length=0;
-  for(const {a,b,count} of boundary.values())if(count===1&&Math.abs(distance(a,plane))<1e-6&&Math.abs(distance(b,plane))<1e-6)segments.push([a,b]);
-  const edges=new Map(), vertices=new Map(), neighbors=new Map();
-  for(const [a,b] of segments){
-    const ka=key(a),kb=key(b),e=[ka,kb].sort().join('|');
-    if(edges.has(e))continue;edges.set(e,[ka,kb]);vertices.set(ka,a);vertices.set(kb,b);
-    if(!neighbors.has(ka))neighbors.set(ka,[]);if(!neighbors.has(kb))neighbors.set(kb,[]);
-    neighbors.get(ka).push(kb);neighbors.get(kb).push(ka);
-  }
-  const used=new Set();
-  for(const [start] of neighbors){
-    if(used.has(start))continue;
-    const keys=[];let current=start,previous=null;
-    while(!used.has(current)){
-      used.add(current);keys.push(current);const next=neighbors.get(current)?.find(k=>k!==previous);
-      if(!next)break;previous=current;current=next;
-    }
-    if(current!==start||keys.length<3)continue;
-    const [uAxis,vAxis]=planeBasis(plane),points=keys.map(k=>vertices.get(k));
-    const projected=points.map(v=>[dot(v,uAxis),dot(v,vAxis)]);
-    const loop=points.map((point,i)=>{
-      const v=[...point];
-      v[3]=plane[0];v[4]=plane[1];v[5]=plane[2];
-      // A square painted soil texture uses equal scale in both plane directions.
-      // Keep these UVs independent of the exterior's narrow grass/stone atlas.
-      v[6]=projected[i][0]*.85+interiorOffset[0];
-      v[7]=projected[i][1]*.85+interiorOffset[1];
-      v[8]=v[9]=v[10]=v[11]=1;v[12]=.342;v[13]=.43;v[14]=0;
-      return v;
-    });
-    // Babylon uses clockwise front faces: tangent × up is the inward geometric
-    // cross product, so this winding exposes the outward fracture normal.
-    for(const tri of earClip(loop,plane))kept.push({v:tri,mat:2,cut:true});
-  }
-  return kept;
+  const height=(x,y)=>.032*Math.sin(x*15+phase)*Math.cos(y*12+phase*.73)+.014*Math.sin(x*24+y*8+phase*1.37);
+  const field=point=>distance(point,plane)-height(dot(point,u),dot(point,v));
+  const project=point=>{
+    const offset=field(point);for(let i=0;i<3;i++)point[i]-=plane[i]*offset;
+    return point;
+  };
+  const normal=point=>{
+    const x=dot(point,u),y=dot(point,v),du=.48*Math.cos(x*15+phase)*Math.cos(y*12+phase*.73)+.336*Math.cos(x*24+y*8+phase*1.37);
+    const dv=-.384*Math.sin(x*15+phase)*Math.sin(y*12+phase*.73)+.112*Math.cos(x*24+y*8+phase*1.37);
+    return unit(plane.slice(0,3).map((value,i)=>value-u[i]*du-v[i]*dv));
+  };
+  return {field,project,normal};
 }
 
-export function fractureBlock(source) {
+function sourceSampler(faces) {
+  const bounds=items=>{
+    const min=[Infinity,Infinity,Infinity],max=[-Infinity,-Infinity,-Infinity];
+    for(const face of items)for(const p of face.v)for(let j=0;j<3;j++){min[j]=Math.min(min[j],p[j]);max[j]=Math.max(max[j],p[j]);}
+    return {min,max};
+  };
+  const build=items=>{
+    const node=bounds(items);if(items.length<=10){node.faces=items;return node;}
+    const extent=node.max.map((v,j)=>v-node.min[j]),axis=extent.indexOf(Math.max(...extent));
+    items.sort((a,b)=>a.v.reduce((s,v)=>s+v[axis],0)-b.v.reduce((s,v)=>s+v[axis],0));
+    const half=Math.floor(items.length/2);node.left=build(items.slice(0,half));node.right=build(items.slice(half));return node;
+  };
+  const tree=build([...faces]),columns=new Map();
+  const column=(x,z)=>{
+    const id=x.toFixed(9)+','+z.toFixed(9);if(columns.has(id))return columns.get(id);
+    const hits=[],visit=node=>{
+      if(x<node.min[0]-1e-9||x>node.max[0]+1e-9||z<node.min[2]-1e-9||z>node.max[2]+1e-9)return;
+      if(!node.faces){visit(node.left);visit(node.right);return;}
+      for(const {v:[a,b,c]} of node.faces){
+        const den=(b[2]-c[2])*(a[0]-c[0])+(c[0]-b[0])*(a[2]-c[2]);if(Math.abs(den)<1e-13)continue;
+        const u=((b[2]-c[2])*(x-c[0])+(c[0]-b[0])*(z-c[2]))/den,w=((c[2]-a[2])*(x-c[0])+(a[0]-c[0])*(z-c[2]))/den;
+        if(u>=-1e-9&&w>=-1e-9&&u+w<=1+1e-9)hits.push(a[1]*u+b[1]*w+c[1]*(1-u-w));
+      }
+    };visit(tree);hits.sort((a,b)=>a-b);
+    const result=hits.filter((v,i)=>!i||v-hits[i-1]>1e-7);columns.set(id,result);return result;
+  };
+  const subtract=(a,b)=>a.slice(0,3).map((v,j)=>v-b[j]);
+  const closest=(p,face)=>{
+    const [a,b,c]=face.v,ab=subtract(b,a),ac=subtract(c,a),ap=subtract(p,a),d1=dot(ab,ap),d2=dot(ac,ap);let weights;
+    if(d1<=0&&d2<=0)weights=[1,0,0];
+    else {
+      const bp=subtract(p,b),d3=dot(ab,bp),d4=dot(ac,bp);
+      if(d3>=0&&d4<=d3)weights=[0,1,0];
+      else {
+        const vc=d1*d4-d3*d2;
+        if(vc<=0&&d1>=0&&d3<=0){const v=d1/(d1-d3);weights=[1-v,v,0];}
+        else {
+          const cp=subtract(p,c),d5=dot(ab,cp),d6=dot(ac,cp);
+          if(d6>=0&&d5<=d6)weights=[0,0,1];
+          else {
+            const vb=d5*d2-d1*d6;
+            if(vb<=0&&d2>=0&&d6<=0){const w=d2/(d2-d6);weights=[1-w,0,w];}
+            else {
+              const va=d3*d6-d5*d4;
+              if(va<=0&&d4-d3>=0&&d5-d6>=0){const w=(d4-d3)/((d4-d3)+(d5-d6));weights=[0,1-w,w];}
+              else {const inv=1/(va+vb+vc),v=vb*inv,w=vc*inv;weights=[1-v-w,v,w];}
+            }
+          }
+        }
+      }
+    }
+    const point=[0,1,2].map(i=>a[i]*weights[0]+b[i]*weights[1]+c[i]*weights[2]);
+    return {weights,face,distanceSquared:subtract(point,p).reduce((sum,v)=>sum+v*v,0)};
+  };
+  const boxDistance=(node,p)=>p.slice(0,3).reduce((sum,v,j)=>sum+Math.max(node.min[j]-v,0,v-node.max[j])**2,0);
+  const nearest=(p,material=null)=>{
+    let best={distanceSquared:Infinity};
+    const visit=node=>{
+      if(boxDistance(node,p)>best.distanceSquared)return;
+      if(node.faces){for(const face of node.faces){if(material!==null&&face.mat!==material)continue;const hit=closest(p,face);if(hit.distanceSquared<best.distanceSquared)best=hit;}return;}
+      const first=boxDistance(node.left,p)<boxDistance(node.right,p)?node.left:node.right;
+      visit(first);visit(first===node.left?node.right:node.left);
+    };visit(tree);
+    const [a,b,c]=best.face.v,w=best.weights;
+    best.value=a.map((_,i)=>a[i]*w[0]+b[i]*w[1]+c[i]*w[2]);return best;
+  };
+  return {column,nearest,clearColumns:()=>columns.clear()};
+}
+
+function roundedFragment(piece,sampler,interiorOffset) {
+  const radius=Math.min(.05,Math.min(...piece.extent)*.18),spacing=radius/4.2,padding=radius+spacing*2;
+  const start=piece.min.map(v=>Math.floor((v-padding)/spacing)),end=piece.max.map(v=>Math.ceil((v+padding)/spacing));
+  const [nx,ny,nz]=end.map((v,j)=>v-start[j]+1),origin=start.map(v=>v*spacing),occupancy=new Uint8Array(nx*ny*nz);
+  for(let z=0;z<nz;z++)for(let x=0;x<nx;x++){
+    const px=origin[0]+x*spacing,pz=origin[2]+z*spacing,hits=sampler.column(px,pz);if(hits.length<2)continue;
+    for(let y=0;y<ny;y++){
+      const py=origin[1]+y*spacing;let inside=false;
+      for(let j=0;j+1<hits.length;j+=2)if(py>=hits[j]&&py<=hits[j+1]){inside=true;break;}
+      if(!inside)continue;
+      const point=[px,py,pz];if(piece.constraints.every(c=>c.surface.field(point)*c.side<=0))occupancy[x+nx*(y+ny*z)]=1;
+    }
+  }
+  const solid=roundVoxelSolid({occupancy,nx,ny,nz,origin,spacing,radius}),faces=[],nodes=new Map(),records=new Map(),crossings=new Map();
+  const vertex=id=>{
+    if(nodes.has(id))return nodes.get(id);
+    const p=solid.positions.slice(id*3,id*3+3),n=solid.normals.slice(id*3,id*3+3),hit=sampler.nearest(p);
+    const signal=Math.min(radius*.85-Math.sqrt(hit.distanceSquared),radius*(dot(n,hit.value.slice(3,6))-.15));
+    const node={id,p,n,hit,signal};nodes.set(id,node);return node;
+  };
+  const crossing=(a,b)=>{
+    const from=a.id<b.id?a:b,to=a.id<b.id?b:a,id='edge-'+from.id+':'+to.id;
+    if(crossings.has(id))return crossings.get(id);
+    const t=from.signal/(from.signal-to.signal),p=mix(from.p,to.p,t),n=unit(mix(from.n,to.n,t));
+    const node={id,p,n,hit:sampler.nearest(p),signal:0};crossings.set(id,node);return node;
+  };
+  const clipped=(triangle,exterior)=>{
+    const poly=[];
+    for(let j=0;j<3;j++){
+      const a=triangle[j],b=triangle[(j+1)%3],inside=exterior?a.signal>=0:a.signal<=0;
+      if(inside)poly.push(a);
+      if((a.signal<0&&b.signal>0)||(a.signal>0&&b.signal<0))poly.push(crossing(a,b));
+    }
+    return poly.filter((node,i)=>node.id!==poly[(i+poly.length-1)%poly.length].id);
+  };
+  const append=(polygon,exterior)=>{
+    if(polygon.length<3)return;
+    const center=[0,1,2].map(j=>polygon.reduce((sum,node)=>sum+node.p[j],0)/polygon.length);
+    const votes=[0,0];for(const node of polygon)votes[node.hit.face.mat]++;
+    const mat=exterior?(votes[0]>=votes[1]?0:1):2;
+    const cut=piece.constraints.reduce((best,c)=>Math.abs(c.surface.field(center))<Math.abs(best.surface.field(center))?c:best),[uAxis,vAxis]=planeBasis(cut.plane);
+    const vertices=polygon.map(node=>{
+      const cacheKey=node.id+':'+mat+(exterior?'':':'+cut.cutId);if(records.has(cacheKey))return records.get(cacheKey);
+      let value;
+      if(exterior){
+        const attributes=node.hit.face.mat===mat?node.hit.value:sampler.nearest(node.p,mat).value;
+        value=[...node.p,...node.n,...attributes.slice(6)];
+      }
+      else value=[...node.p,...node.n,dot(node.p,uAxis)*.55+interiorOffset[0],dot(node.p,vAxis)*.55+interiorOffset[1],1,1,1,1,.342,.43,0];
+      records.set(cacheKey,value);return value;
+    });
+    for(let i=1;i<vertices.length-1;i++)faces.push({v:[vertices[0],vertices[i],vertices[i+1]],mat,cut:!exterior,cutId:exterior?undefined:cut.cutId});
+  };
+  // Snap the shared scalar contour, not individual triangle intersections, so
+  // float32 upload cannot collapse tiny slivers or create mismatched seam edges.
+  const snap=new Set();
+  for(let i=0;i<solid.indices.length;i+=3)for(let j=0;j<3;j++){
+    const a=vertex(solid.indices[i+j]),b=vertex(solid.indices[i+(j+1)%3]);
+    if(a.signal*b.signal>=0)continue;
+    const t=a.signal/(a.signal-b.signal),length=Math.hypot(...a.p.map((v,k)=>v-b.p[k]));
+    if(t*length<1e-5)snap.add(a.id);
+    if((1-t)*length<1e-5)snap.add(b.id);
+  }
+  for(const id of snap)nodes.get(id).signal=0;
+  for(let i=0;i<solid.indices.length;i+=3){
+    const triangle=solid.indices.slice(i,i+3).map(vertex);
+    if(triangle.every(v=>v.signal>=0))append(triangle,true);
+    else if(triangle.every(v=>v.signal<=0))append(triangle,false);
+    else {append(clipped(triangle,true),true);append(clipped(triangle,false),false);}
+  }
+  return {faces,stats:{...solid.stats,cellSize:spacing,radius}};
+}
+export function fractureBlock(source, {variant=0} = {}) {
+  if(!Number.isInteger(variant)||variant<0||variant>0xffffffff)throw new RangeError('Fracture variant must be an unsigned 32-bit integer.');
   const scene=source.getScene(),position=source.getVerticesData('position'),normal=source.getVerticesData('normal'),uv=source.getVerticesData('uv'),color=source.getVerticesData('color'),stone=source.getVerticesData('terrainStoneUV'),bottom=source.getVerticesData('terrainBottomLight');
   const vertices=Array.from({length:position.length/3},(_,i)=>[...position.slice(i*3,i*3+3),...normal.slice(i*3,i*3+3),...uv.slice(i*2,i*2+2),...color.slice(i*4,i*4+4),...stone.slice(i*2,i*2+2),bottom[i]]);
-  weldPositions(vertices);
-  const index=source.getIndices(),topCount=source.subMeshes[0].indexCount,original=[];
+  const index=source.getIndices(),topCount=source.subMeshes[0].indexCount;let original=[];
   for(let i=0;i<index.length;i+=3)original.push({v:[vertices[index[i]],vertices[index[i+1]],vertices[index[i+2]]],mat:i<topCount?0:1});
-  const tileIndex=source.metadata?.tileIndex??0, seed=(Math.imul(tileIndex+1,0x45d9f3b)^0x9e3779b9)>>>0;
+  if(!sourceSamplers.has(source))sourceSamplers.set(source,sourceSampler(original));
+  const sampler=sourceSamplers.get(source);
+  // Keep the BVH for the source lifetime, but do not retain ray columns from
+  // every different grid produced by repeated reset/variant cycles.
+  sampler.clearColumns();
+  let variantSeed=Math.imul(variant,0x85ebca6b);variantSeed^=variantSeed>>>16;
+  const tileIndex=source.metadata?.tileIndex??0, seed=(Math.imul(tileIndex+1,0x45d9f3b)^variantSeed^0x9e3779b9)>>>0;
   const interiorOffset=[(seed&255)/255,((seed>>>8)&255)/255];
   const random=randomSequence(seed), targetCount=8+Math.floor(random()*5);
-  const pieces=[{faces:original,...measure(original),heightSplit:false}];
-  // Split each solid in two. Cut topology belongs to the tile, never the camera.
-  // Height cuts leave buried stone chunks alongside the upper turf pieces.
-  for(let split=0;pieces.length<targetCount;split++){
-    const candidates=pieces.map((piece,i)=>({piece,i})).filter(({piece})=>split<3||split>=7||!piece.heightSplit);
-    const largest=candidates.reduce((best,item)=>item.piece.volume>best.piece.volume?item:best).i, piece=pieces[largest];
-    // Four broad columns first; then break each through its height. Subsequent
-    // cuts follow its longest dimension so shards remain rock chunks, not blades.
-    const axis=split===0?0:split<3?2:split<7?1:piece.extent.indexOf(Math.max(...piece.extent));
-    let a,b,measureA,measureB;
-    for(let attempt=0;attempt<48;attempt++){
-      const slope=()=> (random()<.5?-1:1)*(.11+random()*.04);
-      const components=[slope(),slope(),slope()];components[axis]=1;
-      const normal=unit(components);
-      let offset=dot(piece.center,normal)+(random()-.5)*piece.extent[axis]*.14;
-      // Keep cuts clear of existing vertices and reject numerical sliver cuts.
-      const projections=piece.faces.flatMap(face=>face.v.map(v=>dot(v,normal)));
-      for(let nudge=0;nudge<100&&projections.some(v=>Math.abs(v-offset)<3e-6);nudge++)offset+=.000071;
-      const plane=[...normal,offset];
-      a=cut(piece.faces,plane,interiorOffset);b=cut(piece.faces,plane.map(v=>-v),interiorOffset);
-      measureA=measure(a);measureB=measure(b);
-      const chunky=m=>m.volume/piece.volume>.28&&m.volume/piece.volume<.72&&Math.max(...m.extent)/Math.min(...m.extent)<3.5&&m.volume/m.extent.reduce((a,b)=>a*b,1)>.28;
-      if(chunky(measureA)&&chunky(measureB)&&isClosedSolid(a)&&isClosedSolid(b))break;
-      if(attempt===47)throw new Error('Unable to form closed tile fracture');
+  const sampleStep=.05,sourceBounds=measure(original),points=[];
+  for(let z=sourceBounds.min[2]+sampleStep/2;z<sourceBounds.max[2];z+=sampleStep)for(let x=sourceBounds.min[0]+sampleStep/2;x<sourceBounds.max[0];x+=sampleStep){
+    const hits=sampler.column(x,z);
+    for(let y=sourceBounds.min[1]+sampleStep/2;y<sourceBounds.max[1];y+=sampleStep){
+      for(let j=0;j+1<hits.length;j+=2)if(y>=hits[j]&&y<=hits[j+1]){points.push([x,y,z]);break;}
     }
-    const heightSplit=piece.heightSplit||axis===1;
-    pieces.splice(largest,1,{faces:a,...measureA,heightSplit},{faces:b,...measureB,heightSplit});
+  }
+  const moments=points=>{
+    const center=[0,0,0],min=[Infinity,Infinity,Infinity],max=[-Infinity,-Infinity,-Infinity];
+    for(const p of points)for(let j=0;j<3;j++){center[j]+=p[j];min[j]=Math.min(min[j],p[j]-sampleStep/2);max[j]=Math.max(max[j],p[j]+sampleStep/2);}
+    return {points,center:center.map(v=>v/points.length),min,max,extent:max.map((v,j)=>v-min[j]),volume:points.length*sampleStep**3};
+  };
+  const pieces=[{...moments(points),heightSplit:false,constraints:[]}],crackCuts=[];
+  const columnHeading=random()*Math.PI;
+  // Coarse samples choose balanced cuts; they are never rendered. The final
+  // closed surface comes solely from the finer rounded-solid reconstruction.
+  for(let split=0;pieces.length<targetCount;split++){
+    const candidates=pieces.map((piece,i)=>({piece,i})).filter(({piece})=>split===2?piece.constraints.length===1:split<3||split>=7||!piece.heightSplit);
+    const largestVolume=Math.max(...candidates.map(({piece})=>piece.volume));
+    const substantial=candidates.filter(({piece})=>piece.volume>=largestVolume*.70);
+    let ticket=random()*substantial.reduce((sum,{piece})=>sum+piece.volume*piece.volume,0),selected=substantial.at(-1);
+    for(const candidate of substantial){ticket-=candidate.piece.volume**2;if(ticket<=0){selected=candidate;break;}}
+    const largest=selected.i,piece=selected.piece,axis=split<3?null:split<7?1:piece.extent.indexOf(Math.max(...piece.extent));
+    let a,b,plane,surface;
+    for(let attempt=0;attempt<48;attempt++){
+      let components;
+      if(split<3){
+        // Four load-bearing columns remain, but their independent cut headings
+        // and unequal areas no longer form the same axis-aligned quarter grid.
+        const heading=columnHeading+(split?Math.PI/2+(random()-.5)*1.05:0);
+        components=[Math.cos(heading),(random()-.5)*.24,Math.sin(heading)];
+      }else{
+        const slope=()=> (random()-.5)*(split<7?.46:1.0);
+        components=[slope(),slope(),slope()];components[axis]=1;
+      }
+      const normal=unit(components);
+      plane=[...normal,0];surface=fractureSurface(plane,(seed%1024)*.013+split*2.39);
+      // Quantiles of the actual curved cut field vary fragment sizes while
+      // ensuring both children retain substantial source material.
+      const projections=piece.points.map(point=>surface.field(point)).sort((a,b)=>a-b);
+      const quantile=.34+random()*.32,at=Math.max(1,Math.min(projections.length-1,Math.floor(quantile*projections.length)));
+      plane[3]=(projections[at-1]+projections[at])*.5;
+      const left=[],right=[];for(const point of piece.points)(surface.field(point)<=0?left:right).push(point);
+      a=moments(left);b=moments(right);
+      const chunky=m=>m.volume/piece.volume>.28&&m.volume/piece.volume<.72&&Math.max(...m.extent)/Math.min(...m.extent)<3.5&&m.volume/m.extent.reduce((a,b)=>a*b,1)>.28;
+      if(chunky(a)&&chunky(b))break;
+      if(attempt===47)throw new Error('Unable to form substantial tile fragments');
+    }
+    crackCuts.push({surface,constraints:piece.constraints});
+    const constraint={plane,surface,cutId:split},heightSplit=piece.heightSplit||(split>=3&&split<7);
+    pieces.splice(largest,1,
+      {...a,heightSplit,constraints:[...piece.constraints,{...constraint,side:1}]},
+      {...b,heightSplit,constraints:[...piece.constraints,{...constraint,side:-1}]});
   }
   const fragments=[],crackSegments=new Map();
+  // March the same physical cut fields across the intact flat turf for stage one.
+  // No large intermediate clipped meshes are built just to obtain these lines.
+  const crackStep=.025,edge=.44;
+  for(const cut of crackCuts)for(let z=-edge;z<edge;z+=crackStep)for(let x=-edge;x<edge;x+=crackStep){
+    const corners=[[x,.245,z],[Math.min(edge,x+crackStep),.245,z],[Math.min(edge,x+crackStep),.245,Math.min(edge,z+crackStep)],[x,.245,Math.min(edge,z+crackStep)]],intersections=[];
+    for(let i=0;i<4;i++){
+      const a=corners[i],b=corners[(i+1)%4],da=cut.surface.field(a),db=cut.surface.field(b);if((da>0)===(db>0))continue;
+      let lo=0,hi=1;for(let j=0;j<24;j++){const t=(lo+hi)/2;if((cut.surface.field(mix(a,b,t))>0)===(da>0))lo=t;else hi=t;}
+      intersections.push(mix(a,b,(lo+hi)/2));
+    }
+    for(let i=0;i+1<intersections.length;i+=2){
+      const a=intersections[i],b=intersections[i+1],middle=mix(a,b,.5);
+      if(cut.constraints.every(c=>c.surface.field(middle)*c.side<=0))crackSegments.set([key(a),key(b)].sort().join('|'),[a,b]);
+    }
+  }
+
   for(let part=0;part<pieces.length;part++){
-    const {faces,center:centroid,volume,topArea}=pieces[part], center=new Vector3(...centroid);
-    const p=[],n=[],u=[],c=[],s=[],light=[],indices=[];
-    const append=face=>{for(const v of face.v){indices.push(p.length/3);p.push(v[0],v[1],v[2]);n.push(v[3],v[4],v[5]);u.push(v[6],v[7]);c.push(...v.slice(8,12));s.push(v[12],v[13]);light.push(v[14]);}};
-    faces.filter(f=>f.mat===0).forEach(append);const grassIndices=indices.length;
-    faces.filter(f=>f.mat===1).forEach(append);const exteriorIndices=indices.length;
-    faces.filter(f=>f.mat===2).forEach(append);
-    for(const face of faces.filter(f=>f.cut))for(let k=0;k<3;k++){
-      const a=face.v[k],b=face.v[(k+1)%3];
-      if(Math.abs(a[1]-.245)<1e-5&&Math.abs(b[1]-.245)<1e-5){const id=[key(a),key(b)].sort().join('|');crackSegments.set(id,[a,b]);}
+    const rounded=roundedFragment(pieces[part],sampler,interiorOffset),faces=rounded.faces;
+    const {center:centroid,volume,topArea,min,max}=measure(faces), center=new Vector3(...centroid);
+    const supportGroup=pieces[part].constraints.filter(c=>c.cutId<3).map(c=>`${c.cutId}:${c.side}`).join('|');
+    const heightCut=pieces[part].constraints.find(c=>c.cutId>=3&&c.cutId<7);
+    const supportLayer=heightCut.side===1?0:1;
+    const p=[],n=[],u=[],c=[],s=[],light=[],indices=[],vertexIds=new Map();
+    const append=face=>{for(const v of face.v){
+      const id=v;
+      if(!vertexIds.has(id)){
+        vertexIds.set(id,p.length/3);p.push(v[0],v[1],v[2]);n.push(v[3],v[4],v[5]);u.push(v[6],v[7]);c.push(...v.slice(8,12));s.push(v[12],v[13]);light.push(v[14]);
+      }
+      indices.push(vertexIds.get(id));
+    }};
+    faces.filter(f=>f.mat===0).forEach(append);const grassIndices=indices.length,grassVertices=p.length/3;
+    faces.filter(f=>f.mat===1).forEach(append);const exteriorIndices=indices.length,exteriorVertices=p.length/3;
+    const cutSurfaces=[];
+    for(const id of [...new Set(faces.filter(f=>f.mat===2).map(f=>f.cutId))].sort((a,b)=>a-b)){
+      const indexStart=indices.length;faces.filter(f=>f.mat===2&&f.cutId===id).forEach(append);
+      cutSurfaces.push({id,indexStart,indexCount:indices.length-indexStart});
     }
     const root=new TransformNode(`${source.name}-fracture-root-${part}`,scene);root.parent=source.parent;
     const scaledCenter=center.multiply(source.scaling);
@@ -194,55 +305,42 @@ export function fractureBlock(source) {
     Object.assign(data,{positions:p,normals:n,uvs:u,colors:c,indices});data.applyToMesh(mesh);
     mesh.setVerticesData('terrainStoneUV',s,false,2);mesh.setVerticesData('terrainBottomLight',light,false,1);
     mesh.releaseSubMeshes();
-    new SubMesh(0,0,grassIndices,0,grassIndices,mesh);
-    new SubMesh(1,grassIndices,exteriorIndices-grassIndices,grassIndices,exteriorIndices-grassIndices,mesh);
-    new SubMesh(2,exteriorIndices,p.length/3-exteriorIndices,exteriorIndices,indices.length-exteriorIndices,mesh);
+    new SubMesh(0,0,grassVertices,0,grassIndices,mesh);
+    new SubMesh(1,grassVertices,exteriorVertices-grassVertices,grassIndices,exteriorIndices-grassIndices,mesh);
+    new SubMesh(2,exteriorVertices,p.length/3-exteriorVertices,exteriorIndices,indices.length-exteriorIndices,mesh);
     mesh.parent=root;mesh.position.copyFrom(scaledCenter.negate());mesh.scaling.copyFrom(source.scaling);mesh.material=source.material;mesh.receiveShadows=true;
-    mesh.metadata={tileIndex:source.metadata.tileIndex,destructionFragment:true,fragmentIndex:part};
-    fragments.push({root,mesh,base:root.position.clone(),part,center,volume,topArea,seed:(seed+Math.imul(part+1,0x27d4eb2d))>>>0});
+    mesh.metadata={tileIndex:source.metadata.tileIndex,destructionFragment:true,fragmentIndex:part,fractureVariant:variant,cutSurfaces,roundedSolid:rounded.stats};
+    fragments.push({root,mesh,base:root.position.clone(),part,center,volume,topArea,supportGroup,supportLayer,bounds:{min,max},seed:(seed+Math.imul(part+1,0x27d4eb2d))>>>0});
   }
-  const positions=[],indices=[], paths=new Map();
-  // Join tessellated cut edges before drawing. A narrow, varying fracture with
-  // short branches reads as broken turf rather than a uniform polygon symbol.
+  const positions=[],indices=[],neighbors=new Map(),edgePoints=new Map();
+  // Follow the actual curved turf intersection as connected polylines. Branches
+  // arise where physical fractures meet, not once per tessellated edge.
   for(const [a,b] of crackSegments.values()){
-    let dx=b[0]-a[0],dz=b[2]-a[2],length=Math.hypot(dx,dz);if(length<1e-6)continue;
-    dx/=length;dz/=length;if(dx<-.0001||(Math.abs(dx)<.0001&&dz<0)){dx=-dx;dz=-dz;}
-    const offset=-dz*a[0]+dx*a[2],id=[dx,dz,offset].map(v=>v.toFixed(4)).join(',');
-    const lo=Math.min(dx*a[0]+dz*a[2],dx*b[0]+dz*b[2]),hi=Math.max(dx*a[0]+dz*a[2],dx*b[0]+dz*b[2]);
-    const path=paths.get(id);if(path){path.lo=Math.min(lo,path.lo);path.hi=Math.max(hi,path.hi);}else paths.set(id,{dx,dz,offset,lo,hi});
+    const ka=key(a),kb=key(b);edgePoints.set(ka,a);edgePoints.set(kb,b);
+    if(!neighbors.has(ka))neighbors.set(ka,[]);if(!neighbors.has(kb))neighbors.set(kb,[]);
+    neighbors.get(ka).push(kb);neighbors.get(kb).push(ka);
   }
-  const ribbon=(points,widths)=>{
-    for(let i=0;i<points.length-1;i++){
-      const a=points[i],b=points[i+1],dx=b[0]-a[0],dz=b[1]-a[1],length=Math.hypot(dx,dz);if(length<1e-6)continue;
-      const nx=-dz/length,nz=dx/length,start=positions.length/3,wa=widths[i],wb=widths[i+1];
-      positions.push(a[0]+nx*wa,.249,a[1]+nz*wa,a[0]-nx*wa,.249,a[1]-nz*wa,b[0]-nx*wb,.249,b[1]-nz*wb,b[0]+nx*wb,.249,b[1]+nz*wb);
-      indices.push(start,start+2,start+1,start,start+3,start+2);
+  const usedEdges=new Set();
+  const starts=[...neighbors.keys()].sort((a,b)=>(neighbors.get(a).length===2)-(neighbors.get(b).length===2));
+  for(const start of starts)for(const neighbor of neighbors.get(start)){
+    if(usedEdges.has([start,neighbor].sort().join('|')))continue;
+    const path=[edgePoints.get(start)];let previous=start,current=neighbor;
+    while(current){
+      usedEdges.add([previous,current].sort().join('|'));path.push(edgePoints.get(current));
+      if(neighbors.get(current).length!==2||current===start)break;
+      const next=neighbors.get(current).find(k=>k!==previous&&!usedEdges.has([current,k].sort().join('|')));
+      previous=current;current=next;
     }
-  };
-  let pathIndex=0;
-  for(const {dx,dz,offset,lo,hi} of paths.values()){
-    const count=Math.max(4,Math.ceil((hi-lo)/.028)),points=[],widths=[],phase=++pathIndex*1.71+(seed%1000)*.01;
-    for(let i=0;i<=count;i++){
-      const t=i/count,d=lo+(hi-lo)*t;
-      const jitter=(Math.sin(i*2.41+phase)+Math.sin(i*.81+phase)*.45)*.006*Math.sin(Math.PI*t);
-      points.push([dx*d-dz*(offset+jitter),dz*d+dx*(offset+jitter)]);
-      widths.push(.0014+.0019*(.5+.5*Math.sin(i*1.93+phase)));
-    }
-    ribbon(points,widths);
-    for(const fraction of [.30,.68]){
-      const i=Math.floor(count*fraction),origin=points[i],side=fraction<.5?1:-1;
-      const branch=[],width=[],length=.055+.035*(.5+.5*Math.sin(phase));
-      for(let j=0;j<=4;j++){
-        const t=j/4;
-        branch.push([origin[0]+(-dz*side+dx*.35)*length*t+Math.sin(j*2.1+phase)*.003*t,origin[1]+(dx*side+dz*.35)*length*t]);
-        width.push(.0016*(1-t));
-      }
-      ribbon(branch,width);
+    for(let i=0;i<path.length-1;i++){
+      const a=path[i],b=path[i+1],dx=b[0]-a[0],dz=b[2]-a[2],length=Math.hypot(dx,dz);if(length<1e-7)continue;
+      const width=.0018+.00065*Math.sin(a[0]*27+a[2]*19+seed%31),nx=-dz/length*width,nz=dx/length*width,at=positions.length/3;
+      positions.push(a[0]+nx,.249,a[2]+nz,a[0]-nx,.249,a[2]-nz,b[0]-nx,.249,b[2]-nz,b[0]+nx,.249,b[2]+nz);
+      indices.push(at,at+2,at+1,at,at+3,at+2);
     }
   }
   const crack=new Mesh(`${source.name}-cracks`,scene),data=new VertexData(),normals=[];
   VertexData.ComputeNormals(positions,indices,normals);Object.assign(data,{positions,indices,normals});data.applyToMesh(crack);
   crack.parent=source.parent;crack.scaling.copyFrom(source.scaling);crack.isPickable=false;crack.metadata={destructionCrack:true,tileIndex:source.metadata.tileIndex};
   fragments.forEach(f=>f.root.setEnabled(false));
-  return {fragments,crack,dispose(){crack.dispose(false,false);fragments.forEach(f=>{f.mesh.dispose(false,false);f.root.dispose();});}};
+  return {fragments,crack,variant,dispose(){crack.dispose(false,false);fragments.forEach(f=>{f.mesh.dispose(false,false);f.root.dispose();});}};
 }

@@ -49,7 +49,7 @@ export function nineSliceAxis(value, halfExtent, capWidth, uvStart, uvEnd, uvCap
 const sourceClodContour = [0.43274,0.42476,0.42464,0.42168,0.42345,0.41896,0.40176,0.38821,0.38087,0.36608,0.35098,0.34444,0.34454,0.34988,0.36156,0.36956,0.37058,0.37039,0.38066,0.39036,0.39272,0.40352,0.41217,0.40987,0.39961,0.38471,0.36908,0.36228,0.36268,0.3639,0.35843,0.35324,0.34294,0.33465,0.33376,0.33173,0.33149,0.33194,0.33634,0.34311,0.35344,0.3616,0.36456,0.36329,0.35842,0.3565,0.35856,0.36632,0.38042,0.39083,0.39562,0.39288,0.3849,0.37606,0.37092,0.36231,0.33747,0.3234,0.31376,0.30981,0.31165,0.31828,0.33004,0.3392,0.34422,0.35375,0.36123,0.35964,0.3594,0.36114,0.35431,0.34236,0.33567,0.33451,0.33711,0.3425,0.35332,0.36586,0.36949,0.36582,0.37551,0.37061,0.35778,0.3507,0.34682,0.33863,0.33381,0.33438,0.33883,0.34605,0.36009,0.36835,0.36638,0.36267,0.36376,0.36676,0.36348,0.3575,0.35792,0.36597,0.3789,0.38501,0.3822,0.38497,0.38281,0.3687,0.35651,0.34897,0.34703,0.35061,0.35593,0.35555,0.34173,0.33083,0.33147,0.33759,0.34711,0.36059,0.36369,0.38209,0.39442,0.40052,0.40936,0.41543,0.41277,0.40059,0.3859,0.37939,0.37942,0.37784,0.36966,0.35966,0.34618,0.33681,0.33473,0.33524,0.33019,0.3279,0.33404,0.34658,0.35647,0.35351,0.34092,0.33032,0.32655,0.33009,0.33993,0.36065,0.36821,0.36756,0.37138,0.38119,0.3894,0.39304,0.38753,0.37996,0.3783,0.37352,0.35954,0.34682,0.34212,0.3417,0.3452,0.351,0.36019,0.36388,0.35985,0.36021,0.36276,0.35893,0.35418,0.35703,0.36513,0.3743,0.37925,0.37794,0.37818,0.38594,0.39833,0.40529,0.4032,0.39394,0.39801,0.40597,0.42143];
 const clodContourV = (u) => {
   const at = clamp((u - 0.04) / 0.005, 0, sourceClodContour.length - 1), i = Math.floor(at);
-  return Math.max(0.322, sourceClodContour[i] + (sourceClodContour[Math.min(i + 1, sourceClodContour.length - 1)] - sourceClodContour[i]) * (at - i));
+  return sourceClodContour[i] + (sourceClodContour[Math.min(i + 1, sourceClodContour.length - 1)] - sourceClodContour[i]) * (at - i);
 };
 
 export function createNineSliceBlock(scene, seed = 0, frontArt = false, { width = 0.999, depth = 0.999, capWidth = 0.055, capDepth = capWidth } = {}) {
@@ -167,7 +167,11 @@ export function createNineSliceBlock(scene, seed = 0, frontArt = false, { width 
     const a = perimeter[j - 1], b = perimeter[j % n];
     distances.push(distances[j - 1] + Math.hypot(positions[a * 3] - positions[b * 3], positions[a * 3 + 2] - positions[b * 3 + 2]));
   }
-  const stoneUStart = 0.08 + r() * 0.07, stoneUSpan = 0.76, stoneTopV = 0.53, stoneBottomV = 0.32;
+  const stoneTopV = 0.53, stoneBottomV = 0.32;
+  // Match source pixels per world unit in both axes. The board scales X/Z by
+  // 1.16 but leaves Y unchanged; a fixed .76 strip squeezed clods horizontally.
+  const stoneUSpan = (stoneTopV - stoneBottomV) * 724 / artHeight * distances[n] * 1.16 / 2172;
+  const stoneUStart = 0.04 + r() * Math.max(0.01, 0.92 - stoneUSpan);
   const sourceU = distances.map((distance) => stoneUStart + stoneUSpan * distance / distances[n]);
   const wallCoordinate = (value, halfExtent, cap, blend) => {
     const radius = cap + (Math.min(cap, 0.012) - cap) * blend, core = halfExtent - cap;
@@ -200,20 +204,9 @@ export function createNineSliceBlock(scene, seed = 0, frontArt = false, { width 
     return sum / weights + 0.002;
   });
   const rawBottomHeights = perimeter.map((id, j) => positions[id * 3 + 1] - (stoneTopV - contourV[j]) / (stoneTopV - stoneBottomV) * artHeight);
-  const bottomHeights = rawBottomHeights.map((height, j) => {
-    const [x, z] = lowerPoints[j];
-    const cornerDistance = Math.hypot(halfX - Math.abs(x), halfZ - Math.abs(z));
-    const t = clamp(1 - cornerDistance / 0.16), weight = t * t * (3 - 2 * t);
-    if (weight === 0) return height;
-    let support = height;
-    for (let k = 0; k < n; k++) {
-      const distance = Math.abs(lowerDistances[j] - lowerDistances[k]);
-      const cyclic = Math.min(distance, lowerDistances[n] - distance);
-      if (cyclic >= 0.07 && cyclic <= 0.16) support = Math.max(support, rawBottomHeights[k]);
-    }
-    // A corner is supported by the stone on both sides, never a thin hanging flap.
-    return height + (support + 0.018 - height) * weight;
-  });
+  // Keep the source clod's full vertical contour, including at corners. Raising
+  // corner heights shaved the ends flat; round the lower footprint instead.
+  const bottomHeights = rawBottomHeights;
   const solidDepth = grassBottom - Math.min(...bottomHeights);
   const rimRadius = Math.min(0.045, halfX * 0.10, halfZ * 0.10);
   const rings = [];
@@ -229,7 +222,9 @@ export function createNineSliceBlock(scene, seed = 0, frontArt = false, { width 
       const id = perimeter[j % n], x = positions[id * 3], z = positions[id * 3 + 2], topY = positions[id * 3 + 1];
       // Keep neighbouring walls flush. The rounded turf corner transitions into
       // a smaller stone corner without reducing the side's full half-extent.
-      const transition = clamp(ring.t / 0.22), cornerBlend = transition * transition * (3 - 2 * transition);
+      const transition = clamp(ring.t / 0.22), lowerRound = clamp((ring.t - 0.74) / 0.26);
+      const cornerBlend = transition * transition * (3 - 2 * transition)
+        * (1 - 0.88 * lowerRound * lowerRound * (3 - 2 * lowerRound));
       const wallX = wallCoordinate(x, halfX, capWidth, cornerBlend), wallZ = wallCoordinate(z, halfZ, capDepth, cornerBlend);
       const bottomY = bottomHeights[j % n];
       const y = topY + ring.t * (bottomY + rimRadius - topY) - rimRadius * ring.rim;
@@ -309,7 +304,7 @@ export function createNineSliceBlock(scene, seed = 0, frontArt = false, { width 
     let j = 0; while (j < n - 1 && angle > angles[j + 1]) j++;
     const t = (angle - angles[j]) / (angles[j + 1] - angles[j]);
     const hemY = positions[perimeter[j] * 3 + 1] + (positions[perimeter[(j + 1) % n] * 3 + 1] - positions[perimeter[j] * 3 + 1]) * t;
-    const sourceV = stoneTopV + clamp((positions[id * 3 + 1] - hemY) * 0.20, 0, 0.02);
+    const sourceV = stoneTopV + clamp((positions[id * 3 + 1] - hemY) * 0.50, 0, 0.13);
     terrainStoneUV.push(sourceU[j] + (sourceU[j + 1] - sourceU[j]) * t, sourceV);
   }
   terrainStoneUV.push(...uvs.slice(topVertexCount * 2));

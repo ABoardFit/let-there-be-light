@@ -156,7 +156,7 @@ test('every block is a closed oriented solid, including the grass join and under
   } finally { scene.dispose(); engine.dispose(); }
 });
 
-test('stone UVs retain the baseline affine scale while geometry follows the original clods', () => {
+test('stone UVs preserve source pixel aspect and affine height while geometry follows the original clods', () => {
   const engine = new NullEngine(), scene = new Scene(engine);
   try {
     for (const seed of [0, 1, 4, 12, 17, 24]) {
@@ -165,7 +165,7 @@ test('stone UVs retain the baseline affine scale while geometry follows the orig
       for (let j = 0; j < rings[0].length; j++) {
         const top = rings[0][j], bottom = rings.at(-1)[j];
         assert.ok(Math.abs(uv[top * 2 + 1] - 0.53) < 1e-8, 'the stone starts at the original source row');
-        assert.ok(uv[bottom * 2 + 1] >= 0.32 && uv[bottom * 2 + 1] < 0.44, 'geometry terminates at the broad clod contour, not an empty rectangle below it');
+        assert.ok(uv[bottom * 2 + 1] >= 0.30 && uv[bottom * 2 + 1] < 0.44, 'geometry terminates within the original broad clod rows, including their rounded lower tips');
         for (let r = 0; r < rings.length; r++) {
           const id = rings[r][j];
           const physicalT = (p[top * 3 + 1] - p[id * 3 + 1]) / (bodyDepth * 0.80);
@@ -177,8 +177,20 @@ test('stone UVs retain the baseline affine scale while geometry follows the orig
       }
       const lowerY = rings.at(-1).map(id => p[id * 3 + 1]);
       assert.ok(Math.max(...lowerY) - Math.min(...lowerY) > 0.15, 'the original broad scallops must remain visible instead of a nearly flat brick bottom');
-      const sideSpan = (uv[rings[0].at(-1) * 2] - uv[rings[0][0] * 2]) / 4;
-      assert.ok(sideSpan > 0.18 && sideSpan < 0.21, 'each side retains the original large clod scale');
+      // The actual scene scales X/Z by STEP=1.16, but leaves Y unchanged.
+      // Compare measured geometry and atlas pixels, not the generator's U-span
+      // formula: equal pixel densities preserve the original rock proportions.
+      let perimeter = 0;
+      for (let j = 1; j < rings[0].length; j++) {
+        const a = rings[0][j - 1] * 3, b = rings[0][j] * 3;
+        perimeter += Math.hypot(p[b] - p[a], p[b + 2] - p[a + 2]) * 1.16;
+      }
+      const horizontalDensity = (uv[rings[0].at(-1) * 2] - uv[rings[0][0] * 2]) * 2172 / perimeter;
+      for (let j = 0; j < rings[0].length; j++) {
+        const top = rings[0][j], bottom = rings.at(-1)[j];
+        const verticalDensity = (uv[top * 2 + 1] - uv[bottom * 2 + 1]) * 724 / (p[top * 3 + 1] - p[bottom * 3 + 1]);
+        assert.ok(Math.abs(horizontalDensity / verticalDensity - 1) < 0.01, 'original stone pixels must have equal horizontal and vertical world scale');
+      }
       assert.equal(mesh.getVerticesData('terrainStoneUV').length, uv.length);
       mesh.dispose();
     }
@@ -207,15 +219,15 @@ test('neighbouring tiles show four distinct original stone regions on the same f
   try {
     for (let seed = 0; seed < 4; seed++) {
       const mesh = createNineSliceBlock(scene, seed), p = mesh.getVerticesData('position'), uv = mesh.getVerticesData('uv');
-      const {stoneRings, stoneUStart} = mesh.metadata.nineSlice;
+      const {stoneRings, stoneUStart, stoneUSpan} = mesh.metadata.nineSlice;
       const front = stoneRings[0].reduce((best, id) => {
         const score = Math.abs(p[id * 3]) + p[id * 3 + 2];
         return score < Math.abs(p[best * 3]) + p[best * 3 + 2] ? id : best;
       }, stoneRings[0][0]);
-      facingCrops.push(uv[front * 2] - stoneUStart);
+      facingCrops.push((uv[front * 2] - stoneUStart) / stoneUSpan);
       mesh.dispose();
     }
     facingCrops.sort((a, b) => a - b);
-    for (let i = 1; i < facingCrops.length; i++) assert.ok(facingCrops[i] - facingCrops[i - 1] > 0.18, 'adjacent tiles must not all show the same pebble and clods');
+    for (let i = 1; i < facingCrops.length; i++) assert.ok(facingCrops[i] - facingCrops[i - 1] > 0.20, 'adjacent tiles must sample distinct quarters of the original stone strip');
   } finally { scene.dispose(); engine.dispose(); }
 });
