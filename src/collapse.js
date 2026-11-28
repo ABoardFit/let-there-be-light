@@ -371,7 +371,7 @@ function buildFracture(source, {variant=0,crackOnly=false,secondary=false} = {})
     const c0=parent?piece.constraints[0]:null;
     const secondaryCut=c0?{cutId:c0.cutId,side:c0.side,definition:c0.surface.definition,field:c0.surface.field}:undefined;
     const solidConstraints=[...(parent?.solidConstraints||[]),...piece.constraints.map(c=>({cutId:c.cutId,side:c.side,definition:c.surface.definition,field:c.surface.field}))];
-    mesh.metadata={tileIndex:source.metadata.tileIndex,destructionFragment:true,fragmentIndex:part,fractureVariant:variant,cutSurfaces,roundedSolid:rounded.stats,...ancestry};
+    mesh.metadata={stoneTextureRange:[source.metadata.nineSlice.stoneUStart,source.metadata.nineSlice.stoneUSpan],tileIndex:source.metadata.tileIndex,destructionFragment:true,fragmentIndex:part,fractureVariant:variant,cutSurfaces,roundedSolid:rounded.stats,...ancestry};
     return {root,mesh,base:root.position.clone(),part,center,volume,topArea,supportGroup,supportLayer,columnConstraints,solidConstraints,bounds:{min,max},seed:(seed+Math.imul(part+1,0x27d4eb2d))>>>0,...ancestry,...(secondaryCut?{secondaryCut}:{})};
   };
   const roundedParents=[];

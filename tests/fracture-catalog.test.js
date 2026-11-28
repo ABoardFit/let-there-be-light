@@ -161,17 +161,27 @@ test('shipped sixteen patterns contain complete coherent stages and distinct sou
   const manifest = JSON.parse(await readFile(new URL('../public/fractures/manifest.json', import.meta.url), 'utf8'));
   assert.equal(manifest.patterns.length, 16);
   const shapes = new Set(), artwork = new Set(), families = new Set();
+  const sourceEngine = new NullEngine(), sourceScene = new Scene(sourceEngine);
+  try {
   for (const entry of manifest.patterns) {
     const packed = await readFile(new URL(`../public/fractures/${entry.file}`, import.meta.url));
     assert.equal(createHash('sha256').update(packed).digest('hex'), entry.sha256);
     const template = decodeFractureBinary(gunzipSync(packed), { lazy: true });
     assert.equal(template.id, entry.id); assert.equal(template.sourceSeed, entry.id);
     assert.equal(template.geometryPose, 'resting'); families.add(template.family);
+    const rebuilt = createNineSliceBlock(sourceScene, entry.sourceSeed);
+    for (const kind of ['position', 'uv', 'terrainStoneUV']) {
+      const actual = template.source.attributes.find(a => a.kind === kind).data, expected = rebuilt.getVerticesData(kind);
+      assert.equal(actual.length, expected.length, 'shipped source must include the latest UV-seam topology');
+      assert.ok(actual.every((v, i) => Math.abs(v - expected[i]) < 2.5e-5), `pattern ${entry.id}: baked ${kind} must match the current source within codec precision`);
+    }
+    rebuilt.dispose();
     const fingerprint = values => createHash('sha256').update(new Uint8Array(values.buffer, values.byteOffset, values.byteLength)).digest('hex');
     shapes.add(fingerprint(template.fracture.crack.attributes.find(a => a.kind === 'position').data));
     artwork.add(fingerprint(template.source.attributes.find(a => a.kind === 'terrainStoneUV').data));
     for (const fragment of [...template.fracture.fragments, ...template.fracture.secondaryFragments]) {
       const mesh = fragment.mesh, positions = mesh.attributes.find(a => a.kind === 'position').data, vertices = positions.length / 3;
+      assert.deepEqual(mesh.metadata.stoneTextureRange, [template.source.metadata.nineSlice.stoneUStart, template.source.metadata.nineSlice.stoneUSpan], 'baked fragments need the same atlas seam period as their intact source');
       assert.ok(Number.isInteger(vertices) && vertices > 0 && positions.every(Number.isFinite));
       for (const attribute of mesh.attributes) assert.ok(attribute.data.length === vertices * attribute.stride && attribute.data.every(Number.isFinite));
       assert.ok(mesh.indices.length % 3 === 0 && mesh.indices.every(i => i < vertices));
@@ -190,6 +200,7 @@ test('shipped sixteen patterns contain complete coherent stages and distinct sou
     for (let i = 7; i < template.timeline.values.length; i += 8) assert.ok(template.timeline.values[i] === 0 || template.timeline.values[i] === 1);
     template.clearDecodedBuffers(); assert.equal(template.decodedBufferBytes, 0);
   }
+  } finally { sourceScene.dispose(); sourceEngine.dispose(); }
   assert.equal(shapes.size, 16); assert.equal(artwork.size, 16); assert.equal(families.size, 2);
 });
 

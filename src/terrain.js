@@ -147,7 +147,8 @@ export function createNineSliceBlock(scene, seed = 0, frontArt = false, { width 
   }
   const byAngle = (a, b) => Math.atan2(positions[a * 3 + 2], positions[a * 3]) - Math.atan2(positions[b * 3 + 2], positions[b * 3]);
   const outline = [...curveBoundary].sort(byAngle), bodyOutline = [...soilBoundary].sort(byAngle);
-  const topVertexCount = positions.length / 3, topIndexCount = indices.length, topNormals = [...normals];
+  let topVertexCount = positions.length / 3;
+  const topIndexCount = indices.length, topNormals = [...normals];
   const bodyDepth = 0.72 + r() * 0.14, artHeight = bodyDepth * 0.80, n = bodyOutline.length;
   const soilTop = grassBottom;
   // A UV seam needs duplicated vertices, but its positions are identical. All
@@ -173,6 +174,43 @@ export function createNineSliceBlock(scene, seed = 0, frontArt = false, { width 
   const stoneUSpan = (stoneTopV - stoneBottomV) * 724 / artHeight * distances[n] * 1.16 / 2172;
   const stoneUStart = 0.04 + r() * Math.max(0.01, 0.92 - stoneUSpan);
   const sourceU = distances.map((distance) => stoneUStart + stoneUSpan * distance / distances[n]);
+  const terrainStoneUV = [];
+  const seamAngle = Math.atan2(positions[perimeter[0] * 3 + 2], positions[perimeter[0] * 3]);
+  const angles = perimeter.map((id) => (Math.atan2(positions[id * 3 + 2], positions[id * 3]) - seamAngle + Math.PI * 2) % (Math.PI * 2));
+  angles.push(Math.PI * 2);
+  for (let id = 0; id < topVertexCount; id++) {
+    const angle = (Math.atan2(positions[id * 3 + 2], positions[id * 3]) - seamAngle + Math.PI * 2) % (Math.PI * 2);
+    let j = 0; while (j < n - 1 && angle > angles[j + 1]) j++;
+    const t = (angle - angles[j]) / (angles[j + 1] - angles[j]);
+    const hemY = positions[perimeter[j] * 3 + 1] + (positions[perimeter[(j + 1) % n] * 3 + 1] - positions[perimeter[j] * 3 + 1]) * t;
+    const sourceV = stoneTopV + clamp((positions[id * 3 + 1] - hemY) * (stoneTopV - stoneBottomV) / artHeight, 0, 0.13);
+    terrainStoneUV.push(sourceU[j] + (sourceU[j + 1] - sourceU[j]) * t, sourceV);
+  }
+  // The grass UV seam and the stone atlas seam are different. Duplicate only
+  // the crossing rim vertices so a narrow corner never interpolates the entire
+  // atlas strip. The shader wraps this unwrapped coordinate after interpolation.
+  const duplicated = new Map();
+  for (let i = 0; i < topIndexCount; i += 3) {
+    const ids = indices.slice(i, i + 3), us = ids.map(id => terrainStoneUV[id * 2]);
+    if (Math.max(...us) - Math.min(...us) < stoneUSpan * 0.5) continue;
+    for (let j = 0; j < 3; j++) {
+      const id = ids[j];
+      if (terrainStoneUV[id * 2] >= stoneUStart + stoneUSpan * 0.5) continue;
+      let copy = duplicated.get(id);
+      if (copy === undefined) {
+        copy = positions.length / 3; duplicated.set(id, copy);
+        positions.push(...positions.slice(id * 3, id * 3 + 3));
+        normals.push(...normals.slice(id * 3, id * 3 + 3));
+        topNormals.push(...topNormals.slice(id * 3, id * 3 + 3));
+        uvs.push(...uvs.slice(id * 2, id * 2 + 2));
+        terrainStoneUV.push(terrainStoneUV[id * 2] + stoneUSpan, terrainStoneUV[id * 2 + 1]);
+      }
+      indices[i + j] = copy;
+      const owner = patches.find(patch => i >= patch.indexStart && i < patch.indexStart + patch.indexCount);
+      if (owner && !owner.vertexIndices.includes(copy)) owner.vertexIndices.push(copy);
+    }
+  }
+  topVertexCount = positions.length / 3;
   const wallCoordinate = (value, halfExtent, cap, blend) => {
     const radius = cap + (Math.min(cap, 0.012) - cap) * blend, core = halfExtent - cap;
     const absolute = Math.abs(value), newCore = halfExtent - radius;
@@ -295,18 +333,6 @@ export function createNineSliceBlock(scene, seed = 0, frontArt = false, { width 
     for (const id of ids) normals.splice(id * 3, 3, normal.x, normal.y, normal.z);
   }
   for (let i = 0; i < topNormals.length; i++) normals[i] = topNormals[i];
-  const terrainStoneUV = [];
-  const seamAngle = Math.atan2(positions[perimeter[0] * 3 + 2], positions[perimeter[0] * 3]);
-  const angles = perimeter.map((id) => (Math.atan2(positions[id * 3 + 2], positions[id * 3]) - seamAngle + Math.PI * 2) % (Math.PI * 2));
-  angles.push(Math.PI * 2);
-  for (let id = 0; id < topVertexCount; id++) {
-    const angle = (Math.atan2(positions[id * 3 + 2], positions[id * 3]) - seamAngle + Math.PI * 2) % (Math.PI * 2);
-    let j = 0; while (j < n - 1 && angle > angles[j + 1]) j++;
-    const t = (angle - angles[j]) / (angles[j + 1] - angles[j]);
-    const hemY = positions[perimeter[j] * 3 + 1] + (positions[perimeter[(j + 1) % n] * 3 + 1] - positions[perimeter[j] * 3 + 1]) * t;
-    const sourceV = stoneTopV + clamp((positions[id * 3 + 1] - hemY) * 0.50, 0, 0.13);
-    terrainStoneUV.push(sourceU[j] + (sourceU[j + 1] - sourceU[j]) * t, sourceV);
-  }
   terrainStoneUV.push(...uvs.slice(topVertexCount * 2));
   const terrainBottomLight = new Array(positions.length / 3).fill(0);
   for (let level = 1; level < undersideRings.length; level++) {

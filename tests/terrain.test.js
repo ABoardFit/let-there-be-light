@@ -34,10 +34,12 @@ test('resizing a nine-slice block preserves world-space caps and source UVs', ()
       close(extent(center.vertexIndices, 'z'), depth - 2 * capDepth);
       close(extent(center.vertexIndices, 'y'), 0);
       const uvs = Array.from(block.getVerticesData('uv').slice(0, count * 2));
+      // Different aspect ratios can need one extra atlas-seam duplicate. The
+      // authored grass samples must stay the same, independently of duplication.
+      const uniqueUVs = [...new Set(Array.from({ length: uvs.length / 2 }, (_, i) => `${uvs[i * 2].toFixed(10)},${uvs[i * 2 + 1].toFixed(10)}`))].sort();
       if (originalUVs) {
-        assert.equal(uvs.length, originalUVs.length);
-        uvs.forEach((value, i) => close(value, originalUVs[i]));
-      } else originalUVs = uvs;
+        assert.deepEqual(uniqueUVs, originalUVs);
+      } else originalUVs = uniqueUVs;
     }
   } finally {
     scene.dispose();
@@ -53,9 +55,16 @@ test('grass is one connected surface with open edges only along its irregular bo
     const grass = block.subMeshes[0];
     const indices = block.getIndices().slice(grass.indexStart, grass.indexStart + grass.indexCount);
     const positions = block.getVerticesData('position');
+    // UV discontinuities duplicate attributes, not physical surface vertices.
+    const representatives = new Map();
+    const spatial = Array.from({ length: positions.length / 3 }, (_, id) => {
+      const key = positions.slice(id * 3, id * 3 + 3).map(v => v.toFixed(8)).join(',');
+      if (!representatives.has(key)) representatives.set(key, id);
+      return representatives.get(key);
+    });
     const neighbours = new Map(), edges = new Map();
     for (let i = 0; i < indices.length; i += 3) {
-      const [a, b, c] = indices.slice(i, i + 3);
+      const [a, b, c] = indices.slice(i, i + 3).map(id => spatial[id]);
       for (const [from, to] of [[a, b], [b, c], [c, a]]) {
         if (!neighbours.has(from)) neighbours.set(from, new Set());
         if (!neighbours.has(to)) neighbours.set(to, new Set());
@@ -67,14 +76,14 @@ test('grass is one connected surface with open edges only along its irregular bo
         edges.set(key, edge);
       }
     }
-    const pending = [indices[0]], visited = new Set();
+    const pending = [spatial[indices[0]]], visited = new Set();
     while (pending.length) {
       const vertex = pending.pop();
       if (visited.has(vertex)) continue;
       visited.add(vertex);
       for (const neighbour of neighbours.get(vertex)) pending.push(neighbour);
     }
-    assert.equal(visited.size, neighbours.size, 'the top, curved caps and grass sides must share vertices');
+    assert.equal(visited.size, neighbours.size, 'the top, curved caps and grass sides must form one spatially connected surface');
     const bottom = Math.min(...[...neighbours.keys()].map((vertex) => positions[vertex * 3 + 1]));
     const open = [...edges.values()].filter((edge) => edge.uses === 1);
     assert.ok(open.length > 0, 'the grass surface terminates at the soil boundary');
@@ -229,5 +238,46 @@ test('neighbouring tiles show four distinct original stone regions on the same f
     }
     facingCrops.sort((a, b) => a - b);
     for (let i = 1; i < facingCrops.length; i++) assert.ok(facingCrops[i] - facingCrops[i - 1] > 0.20, 'adjacent tiles must sample distinct quarters of the original stone strip');
+  } finally { scene.dispose(); engine.dispose(); }
+});
+
+test('visible grass-rim triangles never interpolate across the atlas and share stone-wall texel density', () => {
+  const engine = new NullEngine(), scene = new Scene(engine);
+  try {
+    for (let seed = 0; seed < 16; seed++) {
+      const mesh = createNineSliceBlock(scene, seed), p = mesh.getVerticesData('position'), uv = mesh.getVerticesData('terrainStoneUV'), indices = mesh.getIndices();
+      const { stoneUSpan, topVertexCount, bodyOutline, stoneRings } = mesh.metadata.nineSlice;
+      const grass = mesh.subMeshes[0]; let visibleTriangles = 0, verticalPairs = 0, duplicatedSeams = 0;
+      for (let i = grass.indexStart; i < grass.indexStart + grass.indexCount; i += 3) {
+        const ids = indices.slice(i, i + 3);
+        if (Math.min(...ids.map(id => p[id * 3 + 1])) >= .20) continue;
+        visibleTriangles++;
+        const us = ids.map(id => uv[id * 2]);
+        assert.ok(Math.max(...us) - Math.min(...us) < stoneUSpan * .1, `pattern ${seed}: a narrow visible rim cannot stretch the whole atlas across one triangle`);
+      }
+      const samePosition = new Map();
+      for (let id = 0; id < topVertexCount; id++) {
+        const key = p.slice(id * 3, id * 3 + 3).map(v => v.toFixed(8)).join(',');
+        if (samePosition.has(key) && Math.abs(uv[id * 2] - uv[samePosition.get(key) * 2]) > stoneUSpan * .5) {
+          duplicatedSeams++;
+          assert.ok(Math.abs(Math.abs(uv[id * 2] - uv[samePosition.get(key) * 2]) - stoneUSpan) < 1e-8, 'seam copies differ by exactly one atlas period');
+        }
+        samePosition.set(key, id);
+      }
+      for (const hem of bodyOutline) {
+        const wall = stoneRings[0].find(id => Math.hypot(p[id * 3] - p[hem * 3], p[id * 3 + 2] - p[hem * 3 + 2]) < 1e-8);
+        assert.notEqual(wall, undefined);
+        const j = stoneRings[0].indexOf(wall), below = stoneRings[1][j];
+        const lowerDensity = (uv[wall * 2 + 1] - uv[below * 2 + 1]) / (p[wall * 3 + 1] - p[below * 3 + 1]);
+        for (let above = 0; above < topVertexCount; above++) {
+          if (p[above * 3 + 1] <= .03 || p[above * 3 + 1] >= .20 || Math.hypot(p[above * 3] - p[hem * 3], p[above * 3 + 2] - p[hem * 3 + 2]) > 1e-8) continue;
+          const upperDensity = (uv[above * 2 + 1] - uv[hem * 2 + 1]) / (p[above * 3 + 1] - p[hem * 3 + 1]);
+          assert.ok(Math.abs(upperDensity / lowerDensity - 1) < 1e-7, 'the grass wrap and stone wall must sample the same vertical pixel scale');
+          verticalPairs++;
+        }
+      }
+      assert.ok(visibleTriangles > 100 && verticalPairs > 100 && duplicatedSeams > 0, 'the test must include visible walls and actual atlas seams');
+      mesh.dispose();
+    }
   } finally { scene.dispose(); engine.dispose(); }
 });

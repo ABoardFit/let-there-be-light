@@ -419,10 +419,11 @@ function grassHemOffset(seed, x, z) {
 // Authored stone UVs and mesh-local height remain attached through rotation and drops.
 class SharedEarthBlend extends MaterialPluginBase {
   constructor(material, earthTexture, fillTransparentStone = false) {
-    super(material, 'SharedEarthBlend', 190, { SHARED_EARTH_BLEND: true, SHARED_EARTH_FILL: fillTransparentStone, TERRAIN_AUTHORED_HEIGHT: false }, true, true);
+    super(material, 'SharedEarthBlend', 190, { SHARED_EARTH_BLEND: true, SHARED_EARTH_FILL: fillTransparentStone, TERRAIN_AUTHORED_HEIGHT: false }, true, false);
     this.earthTexture = earthTexture;
     this.fillTransparentStone = fillTransparentStone;
     this.doNotSerialize = true;
+    this.registerForExtraEvents = true; this._enable(true);
   }
   getClassName() { return 'SharedEarthBlend'; }
   isReadyForSubMesh() { return this.earthTexture.isReady(); }
@@ -432,7 +433,13 @@ class SharedEarthBlend extends MaterialPluginBase {
     if (mesh.isVerticesDataPresent('terrainAuthoredHeight')) attributes.push('terrainAuthoredHeight');
   }
   getSamplers(samplers) { samplers.push('terrainEarthSampler'); }
+  getUniforms() { return { ubo: [{ name: 'terrainStoneRange', size: 2, type: 'vec2' }], fragment: 'uniform vec2 terrainStoneRange;' }; }
   bindForSubMesh(uniformBuffer) { uniformBuffer.setTexture('terrainEarthSampler', this.earthTexture); }
+  hardBindForSubMesh(uniformBuffer, _scene, _engine, subMesh) {
+    const metadata = subMesh.getMesh().metadata, source = metadata?.nineSlice;
+    const range = metadata?.stoneTextureRange || [source?.stoneUStart ?? 0.04, source?.stoneUSpan ?? 0.5];
+    uniformBuffer.updateFloat2('terrainStoneRange', ...range);
+  }
   getActiveTextures(textures) { textures.push(this.earthTexture); }
   hasTexture(value) { return value === this.earthTexture; }
   getCustomCode(shaderType) {
@@ -445,11 +452,13 @@ class SharedEarthBlend extends MaterialPluginBase {
         #endif
         varying vec2 vTerrainStoneUV;
         varying float vTerrainBottomLight;
+        varying float vTerrainNormalY;
         varying vec3 vTerrainLocalPosition;
       `,
       CUSTOM_VERTEX_MAIN_END: `
         vTerrainStoneUV = terrainStoneUV;
         vTerrainBottomLight = terrainBottomLight;
+        vTerrainNormalY = normalUpdated.y;
         vTerrainLocalPosition = positionUpdated;
         #ifdef TERRAIN_AUTHORED_HEIGHT
         vTerrainLocalPosition.y = terrainAuthoredHeight;
@@ -460,6 +469,7 @@ class SharedEarthBlend extends MaterialPluginBase {
     return {
       // Always register this hook, including during MaterialPluginBase construction.
       CUSTOM_FRAGMENT_UPDATE_ALPHA: this.fillTransparentStone ? `
+        if (vTerrainNormalY > -0.4) baseColor = terrainEarthColour(vDiffuseUV);
         if (baseColor.a < 0.98) {
           vec4 originalStone = baseColor;
           vec4 filledStone = baseColor;
@@ -483,17 +493,33 @@ class SharedEarthBlend extends MaterialPluginBase {
         uniform sampler2D terrainEarthSampler;
         varying vec2 vTerrainStoneUV;
         varying float vTerrainBottomLight;
+        varying float vTerrainNormalY;
         varying vec3 vTerrainLocalPosition;
+        vec4 terrainEarthColour(vec2 uv) {
+          float span = max(terrainStoneRange.y, 0.001);
+          float u = mod(uv.x - terrainStoneRange.x, span);
+          // A short shared strip joins the atlas ends at the same corner. The
+          // middle of every face keeps its original hand-painted stone pixels.
+          float width = min(0.025, span * 0.055);
+          float signedSeam = u > span * 0.5 ? u - span : u;
+          if (abs(signedSeam) < width) {
+            vec4 left = texture2D(terrainEarthSampler, vec2(terrainStoneRange.x + span + min(signedSeam, 0.0), uv.y));
+            vec4 right = texture2D(terrainEarthSampler, vec2(terrainStoneRange.x + max(signedSeam, 0.0), uv.y));
+            return mix(left, right, smoothstep(-width, width, signedSeam));
+          }
+          return texture2D(terrainEarthSampler, vec2(terrainStoneRange.x + u, uv.y));
+        }
       `,
       CUSTOM_FRAGMENT_BEFORE_FOG: `
         ${this.fillTransparentStone ? 'color.rgb = mix(baseColor.rgb * 0.93, color.rgb, 0.35);' : ''}
+        ${this.fillTransparentStone ? '' : 'float turfWrap = (1.0 - smoothstep(0.19, 0.245, vTerrainLocalPosition.y)) * smoothstep(-0.04, 0.04, vTerrainLocalPosition.y); color.rgb *= 1.0 + 0.40 * turfWrap;'}
         float edgeNoise = sin(vTerrainLocalPosition.x * 23.0 + sin(vTerrainLocalPosition.z * 17.0)) * 0.018;
-        float seamMix = (1.0 - smoothstep(0.08, 0.245 + edgeNoise, vTerrainLocalPosition.y))
+        float seamMix = (1.0 - smoothstep(-0.01, 0.20 + edgeNoise, vTerrainLocalPosition.y))
           * smoothstep(-0.22, -0.08, vTerrainLocalPosition.y);
         if (seamMix > 0.001) {
           // Match the accepted front's short moss-to-stone transition. This is
           // local height, so the authored stone stays attached to moving blocks.
-          vec3 stoneColour = texture2D(terrainEarthSampler, vTerrainStoneUV).rgb;
+          vec3 stoneColour = terrainEarthColour(vTerrainStoneUV).rgb;
           float stoneLight = 0.80 + 0.18 * max(dot(normalize(normalW), normalize(vec3(-0.8, 1.4, -0.55))), 0.0);
           color.rgb = mix(color.rgb, stoneColour * stoneLight * vec3(1.02, 1.0, 0.95), seamMix);
         }

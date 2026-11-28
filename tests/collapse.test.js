@@ -23,9 +23,12 @@ function inspectSolid(mesh) {
     const values = mesh.getVerticesData(kind);
     assert.equal(values.length, vertexCount * stride, `${kind} must accompany every clipped vertex`);
     assert.ok(values.every(Number.isFinite), `${kind} must remain finite after interpolation`);
-    // Grass UVs deliberately wrap past 0..1; the stone atlas and light mask do not.
-    if (kind === 'terrainStoneUV' || kind === 'terrainBottomLight') {
+    if (kind === 'terrainBottomLight') {
       assert.ok(values.every(value => value >= -1e-9 && value <= 1 + 1e-9), `${kind} must remain inside its authored range within interpolation precision`);
+    }
+    if (kind === 'terrainStoneUV') {
+      const span = mesh.metadata.stoneTextureRange?.[1] ?? mesh.metadata.nineSlice?.stoneUSpan ?? 0;
+      assert.ok(values.every((value, i) => value >= -1e-9 && value <= 1 + (i % 2 ? 0 : span) + 1e-9), 'stone V stays in the atlas; seam U may unwrap by one period before fragment-shader wrapping');
     }
   }
   // The mesh intentionally duplicates vertices at UV seams. Compare positions,
@@ -376,6 +379,7 @@ test('rounded fragments have closed cut faces, bounded remeshing and preserved s
       let fragmentVolume = 0;
       for (const { mesh } of result.fragments) {
         const volume = inspectSolid(mesh);
+        assert.deepEqual(mesh.metadata.stoneTextureRange, [source.metadata.nineSlice.stoneUStart, source.metadata.nineSlice.stoneUSpan], 'every broken piece must retain the original atlas wrap range');
         assert.equal(mesh.metadata.fractureVariant, variant);
         assert.equal(Math.sign(volume), Math.sign(sourceVolume), 'each fragment keeps outward face orientation');
         const { cellSize, radius } = mesh.metadata.roundedSolid;
