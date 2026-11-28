@@ -1,6 +1,6 @@
-import { createContactPreparer, sampleContactTimeline } from './contact-preparer.js';
-import { createFractureCrack } from './collapse.js';
-import { createFracturePreparer } from './fracture-preparer.js';
+import { sampleContactTimeline } from './contact-preparer.js';
+import { loadFractureCatalog, getFractureTemplate } from './fracture-catalog.js';
+import { restoreFracture, restoreFractureMesh } from './fracture-data.js';
 import { enableFragmentFade } from './fragment-fade.js';
 import { createNineSliceBlock } from './terrain.js';
 export { createNineSliceBlock, nineSliceAxis } from './terrain.js';
@@ -26,6 +26,7 @@ import { MorphTargetManager } from '@babylonjs/core/Morph/morphTargetManager.js'
 import '@babylonjs/core/Meshes/instancedMesh.js';
 import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData.js';
 import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
+import { BoundingInfo } from '@babylonjs/core/Culling/boundingInfo.js';
 import { CreateCylinder } from '@babylonjs/core/Meshes/Builders/cylinderBuilder.js';
 import { CreateSphere } from '@babylonjs/core/Meshes/Builders/sphereBuilder.js';
 import { CreateTorus } from '@babylonjs/core/Meshes/Builders/torusBuilder.js';
@@ -283,6 +284,114 @@ function inheritRoofPose(children, parents, surface) {
   }
 }
 
+// Build-time only: preserve the accepted deformation as buffers. The catalog
+// generator snapshots the untouched fracture before calling this function.
+export function bakeFractureStages(source, result, { family = 'inward' } = {}) {
+  const surface = createCrackedSurface(source, result.crack, { family });
+  const buffers = mesh => ({
+    positions: new Float32Array(mesh.getVerticesData('position')),
+    normals: new Float32Array(mesh.getVerticesData('normal')),
+    colors: new Float32Array(mesh.getVerticesData('color')),
+    authoredHeight: new Float32Array(mesh.getVerticesData('terrainAuthoredHeight') || []),
+  });
+  try {
+    bendFragments(result.fragments, surface);
+    const resting = result.fragments.map(f => ({ part: f.part, ...buffers(f.mesh) }));
+    const roof = createSplitRoof(result.fragments, family);
+    roof.update(1); roof.dispose();
+    const supported = result.fragments.map(f => ({ part: f.part, ...buffers(f.mesh), roofSplit: f.mesh.metadata.roofSplit }));
+    inheritRoofPose(result.secondaryFragments || [], result.fragments, surface);
+    const children = (result.secondaryFragments || []).map(f => ({ part: f.part, ...buffers(f.mesh), roofSplit: f.mesh.metadata.roofSplit }));
+    const replaced = new Set((result.secondaryFragments || []).map(f => f.parentPart));
+    const falling = [...result.fragments.filter(f => !replaced.has(f.part)), ...(result.secondaryFragments || [])];
+    surface.update(1);
+    const cracked = buffers(surface.mesh);
+    const crackedLine = new Float32Array(result.crack.getVerticesData('position'));
+    return { family, resting, supported, children, falling, cracked, crackedLine, depth: surface.depth };
+  } finally { surface.mesh.dispose(false, false); }
+}
+
+// Input is a logical horizontal surface, independent of actors, soil walls,
+// cracks, and animated debris. The ray is already in board-local coordinates.
+export function pickTileTop(ray, { size, step = 1.16, heights = [], stages = [], top = .245 }) {
+  if (!Number.isInteger(size) || size < 1 || ray.direction.y >= -1e-8) return null;
+  let selected = null, nearest = Infinity;
+  const half = step / 2, midpoint = (size - 1) / 2;
+  for (let index = 0; index < size * size; index++) {
+    const distance = ((heights[index] || 0) + top - ray.origin.y) / ray.direction.y;
+    if (distance < 0 || distance >= nearest || distance > (ray.length ?? Infinity)) continue;
+    const x = ray.origin.x + ray.direction.x * distance;
+    const z = ray.origin.z + ray.direction.z * distance;
+    const centerX = (index % size - midpoint) * step;
+    const centerZ = (midpoint - Math.floor(index / size)) * step;
+    if (Math.abs(x - centerX) > half + 1e-8 || Math.abs(z - centerZ) > half + 1e-8) continue;
+    selected = index; nearest = distance;
+  }
+  return selected !== null && (stages[selected] || 0) < 3 ? selected : null;
+}
+
+export function chooseFracturePatterns(size, seed = 0, previous = []) {
+  const next = [], random = randomSource(19391 + Math.imul(seed, 7919));
+  for (let index = 0; index < size * size; index++) {
+    const x = index % size, y = Math.floor(index / size), excluded = new Set([previous[index]]);
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const nx = x + dx, ny = y + dy;
+      if ((dx || dy) && nx >= 0 && nx < size && ny >= 0 && ny < size) excluded.add(next[ny * size + nx]);
+    }
+    const choices = Array.from({ length: 16 }, (_, id) => id).filter(id => !excluded.has(id));
+    next.push(choices[Math.floor(random() * choices.length)]);
+  }
+  return next;
+}
+
+function installBakedBuffers(mesh, data) {
+  mesh.setVerticesData('position', new Float32Array(data.positions));
+  mesh.setVerticesData('normal', new Float32Array(data.normals));
+  mesh.setVerticesData('color', new Float32Array(data.colors));
+  if (data.authoredHeight.length) mesh.setVerticesData('terrainAuthoredHeight', new Float32Array(data.authoredHeight), false, 1);
+  if (data.roofSplit) mesh.metadata.roofSplit = structuredClone(data.roofSplit);
+}
+
+export function createBakedCrackedSurface(source, crack, stages, family) {
+  const mesh = source.clone(`${source.name}-cracked-surface`, source.parent, true);
+  mesh.makeGeometryUnique(); mesh.metadata = { ...source.metadata, crackedTerrain: true, surfaceFamily: family };
+  const originals = ['position', 'normal', 'color'].map(kind => new Float32Array(source.getVerticesData(kind)));
+  const targets = [stages.cracked.positions, stages.cracked.normals, stages.cracked.colors];
+  ['position', 'normal', 'color'].forEach((kind, i) => mesh.setVerticesData(kind, originals[i], true));
+  mesh.setVerticesData('terrainAuthoredHeight', originals[0].filter((_, i) => i % 3 === 1), false, 1);
+  const originalLine = new Float32Array(crack.getVerticesData('position'));
+  crack.setVerticesData('position', originalLine, true);
+  const blend = (from, to, t) => Float32Array.from(from, (v, i) => v + (to[i] - v) * t);
+  return { mesh, depth: stages.depth, family, update(t) {
+    ['position', 'normal', 'color'].forEach((kind, i) => mesh.updateVerticesData(kind, blend(originals[i], targets[i], t), kind === 'position'));
+    crack.updateVerticesData('position', blend(originalLine, stages.crackedLine, t), true);
+  } };
+}
+
+export function createBakedSplitRoof(fragments, stages) {
+  const changes = fragments.map(fragment => {
+    const target = stages.supported.find(data => data.part === fragment.part);
+    const mesh = fragment.mesh, manager = new MorphTargetManager(mesh.getScene());
+    const morph = new MorphTarget(`${mesh.name}-supported-bend`, 0, mesh.getScene());
+    manager.optimizeInfluencers = false; morph.setPositions(new Float32Array(target.positions)); morph.setNormals(new Float32Array(target.normals));
+    manager.addTarget(morph); mesh.morphTargetManager = manager; mesh.metadata.roofSplit = structuredClone(target.roofSplit);
+    const bounds = mesh.getBoundingInfo().boundingBox;
+    const minimum = bounds.minimum.clone(), maximum = bounds.maximum.clone();
+    for (let i = 0; i < target.positions.length; i += 3) {
+      minimum.minimizeInPlaceFromFloats(target.positions[i], target.positions[i + 1], target.positions[i + 2]);
+      maximum.maximizeInPlaceFromFloats(target.positions[i], target.positions[i + 1], target.positions[i + 2]);
+    }
+    mesh.setBoundingInfo(new BoundingInfo(minimum, maximum));
+    return { mesh, manager, morph };
+  });
+  const release = change => { if (change.manager) { change.mesh.morphTargetManager = null; change.manager.dispose(); change.manager = null; } };
+  // Keep the same shader and geometry binding while these pieces are visible.
+  // Dropping the morph manager at t=1 forces a new plain draw wrapper even when
+  // that program was prewarmed, producing a blank end frame on some GPUs.
+  return { update(t) { changes.forEach(change => { change.morph.influence = clamp(t); }); },
+    dispose() { changes.forEach(release); } };
+}
+
 function noise(x, y) {
   const hash = (a, b) => {
     let n = Math.imul(a, 374761393) + Math.imul(b, 668265263);
@@ -488,7 +597,7 @@ function paintPine(ctx, width, height) {
   }
 }
 
-export async function createWorld(canvas, { state, onTileClick, onHover, onViewState, reducedMotion = false, labelsRoot }) {
+export async function createWorld(canvas, { state, onTileClick, onHover, onViewState, onLoadProgress, reducedMotion = false, labelsRoot }) {
   const engine = new Engine(canvas, true, { alpha: true, stencil: true, preserveDrawingBuffer: false, powerPreference: 'high-performance' });
   engine.setHardwareScalingLevel(1 / Math.min(window.devicePixelRatio || 1, 1.5));
   const scene = new Scene(engine);
@@ -580,9 +689,10 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   const STEP = 1.16;
   const boardRoot = new TransformNode('board-view-transform', scene);
   let boardPreviewSize = null, previewTerrain = null, rotation = 0, dropMode = false, viewBusy = false;
-  let fractureVariant = 0;
-  const fracturePreparer = createFracturePreparer();
-  const contactPreparer = createContactPreparer();
+  onLoadProgress?.(0);
+  await loadFractureCatalog({ onProgress: (done, total) => onLoadProgress?.(Math.round(done / total * 85)) });
+  onLoadProgress?.(85);
+  let patternSequence = Math.floor(Math.random() * 0x7fffffff);
   const flatCoord = (index, size = SIZE) => new Vector3((index % size - (size - 1) / 2) * STEP, 0, ((size - 1) / 2 - Math.floor(index / size)) * STEP);
   const screenUp = new Vector3(0, Math.sin(camera.beta), Math.cos(camera.beta));
   const screenRight = new Vector3(1, 0, 0);
@@ -594,17 +704,18 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     const root = new TransformNode('terrain-' + label, scene); root.parent = boardRoot;
     const groundTiles = [], tileRoots = [], heights = new Array(boardSize * boardSize).fill(0), details = [];
     const stages = heights.map(() => 0), damage = heights.map(() => null);
+    const patternIds = chooseFracturePatterns(boardSize, patternSequence++);
     const scatterMaterials = ['#bcb493', '#969b70', '#64704c'].map((color, i) => {
       const mat = material('turf-fragments-' + label + '-' + i, color); mat.specularColor.set(0, 0, 0); return mat;
     });
     for (let i = 0; i < boardSize * boardSize; i++) {
       const tileRoot = new TransformNode('tile-height-' + label + '-' + i, scene);
       tileRoot.parent = root; tileRoot.position.copyFrom(flatCoord(i, boardSize)); tileRoots.push(tileRoot);
-      const tile = createNineSliceBlock(scene, i, false);
+      const tile = restoreFractureMesh(scene, getFractureTemplate(patternIds[i]).source);
       tile.parent = tileRoot; tile.scaling.set(STEP, 1, STEP);
       tile.material = groundMaterials[(i * 7 + Math.floor(i / boardSize) * 2) % groundMaterials.length];
       tile.receiveShadows = true; shadows.addShadowCaster(tile); glow.addExcludedMesh(tile);
-      tile.metadata = { ...tile.metadata, tileIndex: i }; groundTiles.push(tile); soilFill.includedOnlyMeshes.push(tile);
+      tile.metadata = { ...tile.metadata, tileIndex: i, fracturePattern: patternIds[i] }; groundTiles.push(tile); soilFill.includedOnlyMeshes.push(tile);
       const scatter = scatterMaterials.map((mat) => ({ positions: [], indices: [], mat }));
       const r = randomSource(1701 + i * 83), count = Math.floor(r() ** 1.3 * 31);
       const clusters = Array.from({ length: 3 }, () => [(r() - 0.5) * 0.64, (r() - 0.5) * 0.64]);
@@ -629,7 +740,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       });
     }
     return {
-      root, groundTiles, tileRoots, heights, stages, damage, details, size: boardSize,
+      root, groundTiles, tileRoots, heights, stages, damage, details, patternIds, size: boardSize,
       dispose() {
         damage.forEach((item) => item?.dispose());
         const removed = new Set([...groundTiles, ...details]);
@@ -702,7 +813,6 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     if (boardPreviewSize !== null && !dropMode) { focus.setEnabled(false); return; }
     keyboardFocus = Number.isInteger(index) && index >= 0 && index < activeTerrain().size ** 2 ? index : null;
     const active = keyboardFocus ?? hovered;
-    warmFracture(active);
     focus.setEnabled(active !== null && isTileAvailable(active)); if (active !== null) focus.position.copyFrom(viewCoord(active));
   };
   const showTargeting = (preview) => {
@@ -806,6 +916,25 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     const job = { started: performance.now(), duration: reducedMotion ? Math.min(duration, 140) : duration, update, resolve };
     animations.add(job);
   });
+  // Keep the currently visible shell until the replacement's actual main and
+  // shadow shader variants are ready. Hot swapping can otherwise report the
+  // previous variant ready while the new MorphTarget program is still linking.
+  const waitForFragmentShaders = async (fragments) => {
+    const meshes = fragments.map(fragment => fragment.mesh);
+    const materials = new Set(meshes.flatMap(mesh => mesh.subMeshes.map(sub => sub.getMaterial())).filter(Boolean));
+    const swapping = [...materials].map(material => [material, material.allowShaderHotSwapping]);
+    swapping.forEach(([material]) => { material.allowShaderHotSwapping = false; });
+    try {
+      while (!disposed && meshes.every(mesh => !mesh.isDisposed())) {
+        const ready = meshes.map(mesh => mesh.isReady(true));
+        if (ready.every(Boolean)) return true;
+        await new Promise(resolve => setTimeout(resolve, 16));
+      }
+      return false;
+    } finally {
+      swapping.forEach(([material, value]) => { material.allowShaderHotSwapping = value; });
+    }
+  };
   const ease = (t) => 1 - (1 - t) ** 3;
   const disposeEffect = (mesh) => { effectMeshes.delete(mesh); if (!mesh.isDisposed()) mesh.dispose(); };
   const effectMaterial = (name, color, alpha = 1) => {
@@ -920,6 +1049,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   const getBoardViewState = () => ({
     rotation: ((Math.round(rotation) % 360) + 360) % 360,
     dropMode, tileStages: [...activeTerrain().stages],
+    patternIds: [...activeTerrain().patternIds],
     crackedTiles: activeTerrain().stages.flatMap((stage, index) => stage === 1 ? [index] : []),
     collapsedTiles: activeTerrain().stages.flatMap((stage, index) => stage === 2 ? [index] : []),
     removedTiles: activeTerrain().stages.flatMap((stage, index) => stage === 3 ? [index] : []),
@@ -952,22 +1082,12 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   const setTileDropMode = (enabled) => {
     if (disposed || busy || viewBusy) return false;
     dropMode = Boolean(enabled); down = null; hovered = null;
-    if (!dropMode && !activeTerrain().damage.some(damage => damage && !damage.fragments.length)) fracturePreparer.cancel();
     showTargeting(null); sync(latestState); setFocus(keyboardFocus); notifyViewState();
     return true;
   };
   const crackMaterial = material('fractured-turf-interior', '#261f16');
   crackMaterial.disableLighting = true; crackMaterial.emissiveColor = hex('#30251a');
   crackMaterial.backFaceCulling = false;
-  function warmFracture(index) {
-    if (!dropMode || busy || viewBusy || !Number.isInteger(index)) return;
-    const terrain = activeTerrain();
-    if (terrain.damage.some(damage => damage && !damage.fragments.length)) return;
-    if (terrain.stages[index] !== 0) return;
-    fracturePreparer.prepare(terrain.groundTiles[index], { variant: fractureVariant, secondary: true }).catch(error => {
-      if (error.name !== 'AbortError') console.error('Fracture preparation failed:', error);
-    });
-  }
   const installFragments = (terrain, index, damage) => {
     damage.motion = createCollapseMotion(index, damage.fragments, { variant: damage.variant, family: damage.family, clearanceFloor: damage.clearanceFloor });
     damage.fragments.forEach(({ mesh, volume, topArea, seed, columnConstraints }, part) => {
@@ -980,62 +1100,66 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   };
   const getDamage = (terrain, index) => {
     if (terrain.damage[index]) return terrain.damage[index];
-    const variant = fractureVariant++;
-    const tile = terrain.groundTiles[index], damage = createFractureCrack(tile, { variant });
-    const seed = (13007 + index * 8191 + Math.imul(variant, 104729)) >>> 0;
-    damage.family = randomSource(seed)() < .5 ? 'inward' : 'outward';
-    const targetHeight = terrain.tileRoots[index].position.y;
-    damage.clearanceFloor = Math.min(...terrain.groundTiles.map(tile => tile.getBoundingInfo().boundingBox.minimum.y * tile.scaling.y + tile.position.y + tile.parent.position.y - targetHeight));
-    damage.crack.material = crackMaterial; glow.addExcludedMesh(damage.crack);
-    // Only the inexpensive partition and crack run on the UI thread. The solid
-    // fragments are prepared during the visible first-stage crack animation.
-    fracturePreparer.prepare(tile, { variant, secondary: true }).catch(error => {
-      if (error.name !== 'AbortError') console.error('Fracture preparation failed:', error);
+    const tile = terrain.groundTiles[index], patternId = terrain.patternIds[index], template = getFractureTemplate(patternId);
+    const damage = restoreFracture(tile, template.fracture);
+    damage.family = template.family; damage.patternId = patternId; damage.template = template;
+    damage.contactTimeline = template.timeline;
+    damage.allFragments = [...damage.fragments, ...damage.secondaryFragments];
+    [damage.crack, ...damage.allFragments.map(fragment => fragment.mesh)].forEach(mesh => {
+      mesh.metadata = { ...mesh.metadata, tileIndex: index, fracturePattern: patternId };
     });
+    damage.crack.material = crackMaterial; glow.addExcludedMesh(damage.crack);
+    installFragments(terrain, index, damage);
+    damage.secondaryFragments.forEach(fragment => {
+      if (template.geometryPose !== 'resting') installBakedBuffers(fragment.mesh, template.stages.children.find(data => data.part === fragment.part));
+      fragment.mesh.material = fractureMaterials.get(tile.material);
+      shadows.addShadowCaster(fragment.mesh); glow.addExcludedMesh(fragment.mesh); soilFill.includedOnlyMeshes.push(fragment.mesh);
+    });
+    const replaced = new Set(damage.secondaryFragments.map(f => f.parentPart));
+    damage.fallingFragments = [...damage.fragments.filter(f => !replaced.has(f.part)), ...damage.secondaryFragments];
     const dispose = damage.dispose;
     let damageDisposed = false;
     damage.dispose = () => {
       if (damageDisposed) return;
-      damageDisposed = true;
-      damage.releaseCrackedShell?.();
-      damage.splitRoof?.dispose();
-      const meshes = new Set((damage.allFragments || damage.fragments).map(({ mesh }) => mesh));
-      soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter((mesh) => !meshes.has(mesh));
-      meshes.forEach((mesh) => { shadows.removeShadowCaster(mesh, false); glow.removeExcludedMesh(mesh); });
-      glow.removeExcludedMesh(damage.crack); damage.releaseFragments?.(); dispose();
+      damageDisposed = true; damage.releaseCrackedShell?.(); damage.splitRoof?.dispose();
+      const meshes = new Set(damage.allFragments.map(({ mesh }) => mesh));
+      soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter(mesh => !meshes.has(mesh));
+      meshes.forEach(mesh => { shadows.removeShadowCaster(mesh, false); glow.removeExcludedMesh(mesh); });
+      glow.removeExcludedMesh(damage.crack); dispose();
     };
     terrain.damage[index] = damage; return damage;
   };
-  const ensureFragments = async (terrain, index, damage) => {
-    if (damage.fragments.length) return;
-    const result = await fracturePreparer.fracture(terrain.groundTiles[index], { variant: damage.variant, secondary: true });
-    if (disposed || terrain.damage[index] !== damage) { result.dispose(); return; }
-    result.crack.dispose(false, false);
-    damage.fragments = result.fragments; damage.secondaryFragments = result.secondaryFragments || []; damage.allFragments = [...damage.fragments, ...damage.secondaryFragments]; damage.releaseFragments = result.dispose;
-    installFragments(terrain, index, damage);
-  };
-  const prepareFinalCollapse = (terrain, index, damage) => {
-    if (damage.contactTimeline) return Promise.resolve(damage.contactTimeline);
-    if (damage.contactPreparing) return damage.contactPreparing;
-    if (!damage.fallingFragments) {
-      inheritRoofPose(damage.secondaryFragments, damage.fragments, damage.surface);
-      const replaced = new Set(damage.secondaryFragments.map(f => f.parentPart));
-      damage.fallingFragments = [...damage.fragments.filter(f => !replaced.has(f.part)), ...damage.secondaryFragments];
-    }
-    const seed = (13007 + index * 8191 + Math.imul(damage.variant, 104729)) >>> 0;
-    damage.contactPreparing = contactPreparer.prepare(damage.fallingFragments,
-      { family: damage.surface.family, variant: damage.variant, seed, clearanceFloor: damage.clearanceFloor })
-      .then(timeline => { if (!disposed && terrain.damage[index] === damage) damage.contactTimeline = timeline; return timeline; })
-      .finally(() => { damage.contactPreparing = null; });
-    return damage.contactPreparing;
+  const prepareBakedSplit = (terrain, index, damage) => {
+    if (damage.splitPreparing) return damage.splitPreparing;
+    damage.splitPreparing = (async () => {
+      // The first crack is already on screen. Upload hidden morph targets while
+      // that short animation runs, rather than making the second hit wait.
+      await animate(16, () => {});
+      if (disposed || terrain.damage[index] !== damage) return false;
+      if (damage.template.geometryPose !== 'resting') damage.fragments.forEach(fragment => installBakedBuffers(fragment.mesh, damage.template.stages.resting.find(data => data.part === fragment.part)));
+      if (!await waitForFragmentShaders(damage.fragments)) return false;
+      if (disposed || terrain.damage[index] !== damage) return false;
+      damage.splitRoof = createBakedSplitRoof(damage.fragments, damage.template.stages);
+      return await waitForFragmentShaders(damage.fragments);
+    })();
+    return damage.splitPreparing;
   };
   const resetTerrainDamage = (terrain) => {
-    fracturePreparer.cancel(); contactPreparer.cancel();
+    const nextPatterns = chooseFracturePatterns(terrain.size, patternSequence++, terrain.patternIds);
     terrain.damage.forEach((damage, i) => {
       damage?.dispose(); terrain.damage[i] = null; terrain.stages[i] = 0;
-      terrain.groundTiles[i].setEnabled(true); terrain.tileRoots[i].position.copyFrom(flatCoord(i, terrain.size));
+      const old = terrain.groundTiles[i], replacement = restoreFractureMesh(scene, getFractureTemplate(nextPatterns[i]).source);
+      replacement.parent = terrain.tileRoots[i]; replacement.material = old.material;
+      replacement.metadata = { ...replacement.metadata, tileIndex: i, fracturePattern: nextPatterns[i] };
+      replacement.receiveShadows = true;
+      shadows.removeShadowCaster(old, false); glow.removeExcludedMesh(old);
+      soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter(mesh => mesh !== old);
+      old.dispose(false, false);
+      shadows.addShadowCaster(replacement); glow.addExcludedMesh(replacement); soilFill.includedOnlyMeshes.push(replacement);
+      terrain.groundTiles[i] = replacement; terrain.patternIds[i] = nextPatterns[i];
+      terrain.tileRoots[i].position.copyFrom(flatCoord(i, terrain.size));
     });
-    terrain.details.forEach((mesh) => mesh.setEnabled(true));
+    terrain.details.forEach(mesh => mesh.setEnabled(true));
   };
   const toggleTileDrop = async (index) => {
     if (disposed || busy || viewBusy || !dropMode) return false;
@@ -1048,11 +1172,9 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       await animate(16, () => {});
       if (disposed) return false;
       const damage = getDamage(terrain, index), tile = terrain.groundTiles[index];
-      if (next === 2) { await ensureFragments(terrain, index, damage); if (disposed) return false; }
-      if (next === 3) { await prepareFinalCollapse(terrain, index, damage); if (disposed) return false; }
       terrain.stages[index] = next;
       if (next === 1) {
-        const surface = createCrackedSurface(tile, damage.crack, { family: damage.family });
+        const surface = createBakedCrackedSurface(tile, damage.crack, damage.template.stages, damage.family);
         damage.surface = surface;
         damage.crackedShell = surface.mesh;
         shadows.addShadowCaster(surface.mesh); glow.addExcludedMesh(surface.mesh); soilFill.includedOnlyMeshes.push(surface.mesh);
@@ -1066,34 +1188,29 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
         tile.setEnabled(false);
         terrain.details.filter((mesh) => mesh.parent === terrain.tileRoots[index]).forEach((mesh) => mesh.setEnabled(false));
         damage.crack.visibility = 0;
+        void prepareBakedSplit(terrain, index, damage);
         await animate(420, (t) => {
           const progress = ease(t); surface.update(progress); damage.crack.visibility = progress;
           damage.crackedDepression = surface.depth * progress;
           if (terrain === battleTerrain) actors.forEach(actor => { if (actor.data.tile === index) actor.root.position.copyFrom(coord(index)); });
         });
       } else if (next === 2) {
-        bendFragments(damage.fragments, damage.surface);
-        damage.splitRoof = createSplitRoof(damage.fragments, damage.surface.family);
+        if (!await prepareBakedSplit(terrain, index, damage)) return false;
         damage.fragments.forEach(({ root }) => root.setEnabled(true));
         damage.releaseCrackedShell?.(); damage.crack.setEnabled(false);
-        await animate(700, (t) => { damage.splitRoof.update(ease(t)); });
-        void prepareFinalCollapse(terrain, index, damage).catch(error => { if (error.name !== 'AbortError') damage.contactError = error; });
+        await animate(420, (t) => { damage.splitRoof.update(ease(t)); });
       } else {
-        damage.splitRoof?.dispose();
         const family = damage.surface.family, parents = damage.fragments;
         const replaced = new Set(damage.secondaryFragments.map(f => f.parentPart));
         damage.fragments = damage.fallingFragments;
         damage.motion = createCollapseMotion(index, damage.fragments, { variant: damage.variant, family, clearanceFloor: damage.clearanceFloor,
           timeline: damage.contactTimeline });
-        damage.secondaryFragments.forEach(({mesh})=>{
-          mesh.material=fractureMaterials.get(tile.material);shadows.addShadowCaster(mesh);glow.addExcludedMesh(mesh);soilFill.includedOnlyMeshes.push(mesh);
-        });
         damage.fragments.forEach(({ mesh }, part) => { mesh.metadata.collapseMotion = damage.motion[part]; });
         damage.releaseCrackedShell?.(); damage.crackedDepression = 0;
         damage.crack.setEnabled(false); sync(latestState); setFocus(null);
         let handedOff = false;
         const starts = damage.fragments.map(({ root }) => ({ position: root.position.clone(), rotation: root.rotation.clone() }));
-        await animate(1800, (t) => {
+        await animate(1200, (t) => {
           if (!handedOff && t >= .08) { parents.filter(f => replaced.has(f.part)).forEach(f => f.root.setEnabled(false)); damage.secondaryFragments.forEach(f => f.root.setEnabled(true)); handedOff = true; }
           damage.fragments.forEach(({ root, mesh }, i) => {
             const start = starts[i], motion = damage.motion[i];
@@ -1142,17 +1259,20 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   const getTileAt = (event) => {
     if (viewBusy || (boardPreviewSize !== null && !dropMode)) return null;
     const rect = canvas.getBoundingClientRect();
-    const x = event.clientX - rect.left, y = event.clientY - rect.top;
+    if (!rect.width || !rect.height) return null;
+    const x = (event.clientX - rect.left) * canvas.clientWidth / rect.width;
+    const y = (event.clientY - rect.top) * canvas.clientHeight / rect.height;
     const viewport = camera.viewport.toGlobal(canvas.clientWidth, canvas.clientHeight);
     const top = canvas.clientHeight - viewport.y - viewport.height;
     if (x < viewport.x || x > viewport.x + viewport.width || y < top || y > top + viewport.height) return null;
-    const pick = scene.pick(x, y, (mesh) => Number.isInteger(mesh.metadata?.tileIndex) && mesh.isEnabled() && isTileAvailable(mesh.metadata.tileIndex));
-    return pick?.hit ? pick.pickedMesh.metadata.tileIndex : null;
+    const terrain = activeTerrain();
+    const ray = scene.createPickingRay(x, y, boardRoot.computeWorldMatrix(true), camera);
+    return pickTileTop(ray, { size: terrain.size, step: STEP, heights: terrain.heights, stages: terrain.stages, top: TURF_HEIGHT });
   };
   const pointerMove = (event) => {
     if (viewBusy || (boardPreviewSize !== null && !dropMode)) return;
     const index = getTileAt(event); if (index !== hovered) { hovered = index; if (!dropMode) onHover?.(index); }
-    const active = index ?? keyboardFocus; warmFracture(active); focus.setEnabled(active !== null && isTileAvailable(active)); if (active !== null) focus.position.copyFrom(viewCoord(active));
+    const active = index ?? keyboardFocus; focus.setEnabled(active !== null && isTileAvailable(active)); if (active !== null) focus.position.copyFrom(viewCoord(active));
     canvas.style.cursor = index === null || busy || viewBusy ? 'default' : 'pointer';
   };
   const pointerLeave = () => { hovered = null; if (boardPreviewSize === null && !dropMode && !viewBusy) onHover?.(null); setFocus(keyboardFocus); };
@@ -1312,12 +1432,37 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       }
     });
   };
+  const warmTemplate = getFractureTemplate(0), warmSource = groundTiles[0];
+  const warmDamage = restoreFracture(warmSource, warmTemplate.fracture);
+  try {
+    const warmPiece = warmDamage.fragments[0];
+    installBakedBuffers(warmPiece.mesh, warmTemplate.stages.resting.find(data => data.part === warmPiece.part));
+    let warmed = 0;
+    for (const combined of fractureMaterials.values()) {
+      warmPiece.mesh.material = combined;
+      shadows.addShadowCaster(warmPiece.mesh); soilFill.includedOnlyMeshes.push(warmPiece.mesh);
+      await waitForFragmentShaders([warmPiece]);
+      const morph = new MorphTarget('warm-supported-bend', 0, scene), manager = new MorphTargetManager(scene);
+      manager.optimizeInfluencers = false;
+      morph.setPositions(new Float32Array(warmPiece.mesh.getVerticesData('position')));
+      morph.setNormals(new Float32Array(warmPiece.mesh.getVerticesData('normal')));
+      manager.addTarget(morph); warmPiece.mesh.morphTargetManager = manager;
+      await waitForFragmentShaders([warmPiece]);
+      warmPiece.mesh.morphTargetManager = null; manager.dispose();
+      onLoadProgress?.(85 + Math.round(++warmed / fractureMaterials.size * 15));
+    }
+  } finally {
+    warmDamage.fragments.forEach(({ mesh }) => shadows.removeShadowCaster(mesh, false));
+    const temporary = new Set(warmDamage.fragments.map(f => f.mesh));
+    soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter(mesh => !temporary.has(mesh));
+    warmDamage.dispose();
+  }
   engine.runRenderLoop(render);
   return {
     sync, showTargeting, setFocus, playEvents, resize, setBoardPreview,
     rotateBoard, setTileDropMode, toggleTileDrop, resetBoardView, getBoardViewState, moveFocusTile, isTileAvailable,
     dispose() {
-      disposed = true; fracturePreparer.dispose(); contactPreparer.dispose(); observer.disconnect(); engine.stopRenderLoop(render);
+      disposed = true;  observer.disconnect(); engine.stopRenderLoop(render);
       previewTerrain?.dispose(); previewTerrain = null;
       labelsRoot.style.visibility = savedLabelVisibility;
       animations.forEach((job) => job.resolve()); animations.clear();

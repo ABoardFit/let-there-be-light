@@ -15,10 +15,10 @@ export function snapshotFractureMesh(mesh) {
 
 export function restoreFractureMesh(scene,data) {
   const mesh=new Mesh(data.name,scene);
-  for(const {kind,stride,data:values} of data.attributes)mesh.setVerticesData(kind,Array.from(values),false,stride);
-  mesh.setIndices(Array.from(data.indices));mesh.releaseSubMeshes();
+  for(const {kind,stride,data:values} of data.attributes)mesh.setVerticesData(kind,values instanceof Float32Array?values.slice():Array.from(values),false,stride);
+  mesh.setIndices(data.indices.slice());mesh.releaseSubMeshes();
   for(const sub of data.subMeshes)new SubMesh(...sub,mesh);
-  mesh.position.copyFromFloats(...data.position);mesh.scaling.copyFromFloats(...data.scaling);mesh.metadata=data.metadata;
+  mesh.position.copyFromFloats(...data.position);mesh.scaling.copyFromFloats(...data.scaling);mesh.metadata=structuredClone(data.metadata);
   return mesh;
 }
 

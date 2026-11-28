@@ -7,11 +7,13 @@
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "test": "node --test"
+    "test": "node --test",
+    "bake:fractures": "node scripts/bake-fractures.mjs"
   },
   "dependencies": {
     "@babylonjs/core": "^8.42.0",
-    "@babylonjs/havok": "^1.3.14"
+    "@babylonjs/havok": "^1.3.14",
+    "meshoptimizer": "^1.3.0"
   },
   "devDependencies": {
     "vite": "^7.2.2"

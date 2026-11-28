@@ -54,7 +54,7 @@ document.querySelector('#app').innerHTML = `
   </footer>
   <p class="sr-only" id="keyboard-help">숫자 1부터 5로 카드 선택, 방향키로 전장 칸 이동, Enter 또는 Space로 사용, Escape 또는 오른쪽 클릭으로 취소, E로 턴 종료. 빛나는 칸은 지정 가능한 위치이며 붉은 칸은 적의 다음 공격 위치입니다.</p>
   <p class="sr-only" id="board-drop-help">방향키로 칸 이동, Enter 또는 Space로 균열, 반붕괴, 추락을 한 단계씩 진행합니다. Escape로 붕괴 모드 종료. 원위치 버튼으로 모든 타일을 복원합니다.</p>
-  <div class="loading-screen" id="loading-screen"><span class="loading-sun">${sun}</span><h2>빛이 있으라</h2><p>구름 너머, 성역으로 향하는 중</p></div>
+  <div class="loading-screen" id="loading-screen"><span class="loading-sun">${sun}</span><h2>빛이 있으라</h2><p id="loading-progress" role="status">성역 준비 중 · 0%</p></div>
   <dialog id="restart-dialog" class="battle-dialog compact-dialog"><h2>새 전투를 시작할까요?</h2><p>진행 중인 전투가 초기화됩니다.<br>수호자의 체력과 덱이 다시 채워져요.</p><div class="dialog-actions"><button class="quiet-button" data-close="restart-dialog">계속 싸우기</button><button class="primary-button" id="confirm-restart">새 전투 시작</button></div></dialog>
   <dialog id="outcome-dialog" class="battle-dialog outcome-dialog"><span class="dialog-mark">${sun}</span><p class="outcome-kicker" id="outcome-kicker">성역에 찾아온 새벽</p><h2 id="outcome-title">빛이 있으라</h2><p id="outcome-message"></p><div class="outcome-stats" id="outcome-stats"></div><button class="primary-button" id="play-again">다시 도전하기</button></dialog>
 </main>`;
@@ -298,6 +298,7 @@ renderHud(); save();
 async function boot() {
   try {
     world = await createWorld(canvas, {
+      onLoadProgress: percent => { const label = document.querySelector('#loading-progress'); if (label) label.textContent = `성역 준비 중 · ${percent}%`; },
       state, onTileClick: clickTile,
       onHover: tile => { if (combatBlocked()) return; hoverTile = tile; canvas.style.cursor = selectedUid && tile !== null ? 'crosshair' : 'default'; updateTargeting(tile); },
       onViewState: receiveBoardView,
@@ -308,7 +309,7 @@ async function boot() {
     showOutcome();
   } catch (error) {
     console.error('Battle initialization failed:', error);
-    document.querySelector('#loading-screen').innerHTML = `<span class="loading-sun">${sun}</span><h2>전장을 불러오지 못했어요</h2><p>브라우저의 그래픽 가속을 켜거나<br>최신 Chrome, Edge, Safari에서 다시 열어 주세요.</p><button class="primary-button" id="retry-button">다시 불러오기</button>`;
+    document.querySelector('#loading-screen').innerHTML = `<span class="loading-sun">${sun}</span><h2>전장을 불러오지 못했어요</h2><p>인터넷 연결을 확인한 뒤 다시 불러와 주세요.<br>계속 실패하면 브라우저 업데이트와 그래픽 가속 설정을 확인해 주세요.</p><button class="primary-button" id="retry-button">다시 불러오기</button>`;
     document.querySelector('#retry-button').addEventListener('click', () => location.reload());
   }
 }

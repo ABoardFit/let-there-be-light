@@ -291,7 +291,7 @@ function inspectTransport(source, result) {
   for (const [i, original] of [result.crack, ...originals.map(f => f.mesh)].entries()) {
     const actual = [restored.crack, ...copies.map(f => f.mesh)][i];
     for (const kind of original.getVerticesDataKinds()) assert.deepEqual(actual.getVerticesData(kind), original.getVerticesData(kind), `worker transport must preserve ${kind}`);
-    assert.deepEqual(actual.getIndices(), original.getIndices());
+    assert.deepEqual(Array.from(actual.getIndices()), Array.from(original.getIndices()), 'typed transport must preserve the actual triangle index values');
     assert.deepEqual(actual.subMeshes.map(s => [s.materialIndex, s.indexStart, s.indexCount]), original.subMeshes.map(s => [s.materialIndex, s.indexStart, s.indexCount]));
   }
   copies.forEach((f, i) => {
