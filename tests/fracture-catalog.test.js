@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { encodeFractureBinary, decodeFractureBinary, fractureDecoderReady } from '../src/fracture-binary.js';
 import { MeshoptEncoder } from 'meshoptimizer/encoder';
-import { chooseFracturePatterns, createBakedSplitRoof } from '../src/scene.js';
+import { chooseFracturePatterns, createBakedCrackedSurface, createBakedSplitRoof } from '../src/scene.js';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
@@ -226,5 +226,34 @@ test('baked stage-two endpoint keeps its live morph shader until the damage is d
     });
     split.dispose(); split.dispose(); assert.equal(scene.morphTargetManagers.length, 0);
     damage.dispose(); source.dispose(); assert.equal(scene.meshes.length, 0);
+  } finally { scene.dispose(); engine.dispose(); }
+});
+
+test('the first cracked replacement starts at the intact surface with complete shader inputs and independent buffers', async () => {
+  await fractureDecoderReady;
+  const packed = await readFile(new URL('../public/fractures/pattern-00.bin.gz', import.meta.url));
+  const template = decodeFractureBinary(gunzipSync(packed), { lazy: true });
+  const engine = new NullEngine(), scene = new Scene(engine);
+  try {
+    const source = restoreFractureMesh(scene, template.source), damage = restoreFracture(source, template.fracture);
+    const original = Object.fromEntries(source.getVerticesDataKinds().map(kind => [kind, Array.from(source.getVerticesData(kind))]));
+    const surface = createBakedCrackedSurface(source, damage.crack, template.stages, template.family);
+    surface.mesh.setEnabled(false);
+    assert.notEqual(surface.mesh.geometry, source.geometry, 'warming a hidden replacement cannot change the visible source');
+    for (const kind of ['position', 'normal', 'color', 'uv', 'terrainStoneUV']) {
+      assert.deepEqual(Array.from(surface.mesh.getVerticesData(kind)), original[kind], 'the first visible replacement must have the intact shape and artwork');
+    }
+    assert.deepEqual(Array.from(surface.mesh.getVerticesData('terrainAuthoredHeight')), original.position.filter((_, i) => i % 3 === 1), 'authored-height shader inputs must exist before shader preparation, not appear on the first visible frame');
+    const originalHeight = Array.from(surface.mesh.getVerticesData('terrainAuthoredHeight'));
+    surface.update(.5);
+    const middle = surface.mesh.getVerticesData('position');
+    assert.ok(middle.some((v, i) => i % 3 === 1 && v < original.position[i] - .02), 'a real partial depression must have begun');
+    surface.update(1);
+    assert.deepEqual(Array.from(surface.mesh.getVerticesData('position')), Array.from(template.stages.cracked.positions));
+    assert.deepEqual(Array.from(surface.mesh.getVerticesData('terrainAuthoredHeight')), originalHeight, 'depression must retain the authored material height');
+    for (const [kind, values] of Object.entries(original)) assert.deepEqual(Array.from(source.getVerticesData(kind)), values);
+    assert.equal(source.isVerticesDataPresent('terrainAuthoredHeight'), false, 'preparing the replacement cannot change the original shader variant');
+    surface.mesh.dispose(false, false); damage.dispose(); source.dispose();
+    assert.equal(scene.meshes.length, 0); assert.equal(scene.geometries.length, 0); assert.equal(scene.morphTargetManagers.length, 0);
   } finally { scene.dispose(); engine.dispose(); }
 });

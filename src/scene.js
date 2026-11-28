@@ -1201,6 +1201,9 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       terrain.stages[index] = next;
       if (next === 1) {
         const surface = createBakedCrackedSurface(tile, damage.crack, damage.template.stages, damage.family);
+        // A new authored-height shell has its own draw wrappers. Keep the
+        // original visible until those wrappers and shadow passes are ready.
+        surface.mesh.setEnabled(false); damage.crack.visibility = 0;
         damage.surface = surface;
         damage.crackedShell = surface.mesh;
         shadows.addShadowCaster(surface.mesh); glow.addExcludedMesh(surface.mesh); soilFill.includedOnlyMeshes.push(surface.mesh);
@@ -1211,9 +1214,11 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
           soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter(mesh => mesh !== shell);
           shell.dispose(false, false); damage.crackedShell = null;
         };
+        if (!await waitForFragmentShaders([{ mesh: surface.mesh }])) return false;
+        if (disposed || terrain.damage[index] !== damage) return false;
+        surface.mesh.setEnabled(true);
         tile.setEnabled(false);
         terrain.details.filter((mesh) => mesh.parent === terrain.tileRoots[index]).forEach((mesh) => mesh.setEnabled(false));
-        damage.crack.visibility = 0;
         void prepareBakedSplit(terrain, index, damage);
         await animate(420, (t) => {
           const progress = ease(t); surface.update(progress); damage.crack.visibility = progress;
@@ -1460,11 +1465,16 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   };
   const warmTemplate = getFractureTemplate(0), warmSource = groundTiles[0];
   const warmDamage = restoreFracture(warmSource, warmTemplate.fracture);
+  const warmShell = createBakedCrackedSurface(warmSource, warmDamage.crack, warmTemplate.stages, warmTemplate.family).mesh;
+  warmShell.setEnabled(false);
+  shadows.addShadowCaster(warmShell); soilFill.includedOnlyMeshes.push(warmShell);
   try {
     const warmPiece = warmDamage.fragments[0];
     installBakedBuffers(warmPiece.mesh, warmTemplate.stages.resting.find(data => data.part === warmPiece.part));
     let warmed = 0;
-    for (const combined of fractureMaterials.values()) {
+    for (const [ground, combined] of fractureMaterials) {
+      warmShell.material = ground;
+      await waitForFragmentShaders([{ mesh: warmShell }]);
       warmPiece.mesh.material = combined;
       shadows.addShadowCaster(warmPiece.mesh); soilFill.includedOnlyMeshes.push(warmPiece.mesh);
       await waitForFragmentShaders([warmPiece]);
@@ -1478,6 +1488,9 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       onLoadProgress?.(85 + Math.round(++warmed / fractureMaterials.size * 15));
     }
   } finally {
+    shadows.removeShadowCaster(warmShell, false);
+    soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter(mesh => mesh !== warmShell);
+    warmShell.dispose(false, false);
     warmDamage.fragments.forEach(({ mesh }) => shadows.removeShadowCaster(mesh, false));
     const temporary = new Set(warmDamage.fragments.map(f => f.mesh));
     soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter(mesh => !temporary.has(mesh));
