@@ -8,8 +8,9 @@ import { Vector3, Matrix } from '@babylonjs/core/Maths/math.vector.js';
 import { Ray } from '@babylonjs/core/Culling/ray.js';
 import { createHash } from 'node:crypto';
 import { createNineSliceBlock } from '../src/terrain.js';
-import { fractureBlock } from '../src/collapse.js';
-import { createCollapseMotion, collapsePose, createCrackedSurface } from '../src/scene.js';
+import { fractureBlock, createFractureCrack } from '../src/collapse.js';
+import { snapshotFracture, restoreFracture, fractureTransferables } from '../src/fracture-data.js';
+import { createCollapseMotion, collapsePose, createCrackedSurface, createSplitRoof } from '../src/scene.js';
 
 function inspectSolid(mesh) {
   const positions = mesh.getVerticesData('position'), indices = mesh.getIndices();
@@ -205,38 +206,82 @@ function inspectCrackedSurface(source, crack, family) {
     assert.ok(hit.hit, 'the crack must stay over the deformed turf');
     assert.ok(Math.abs(marks[i + 1] - hit.pickedPoint.y - .004) < 1e-5, 'the crack must follow the actual triangles instead of floating above the depression');
   }
-  const crackedPositions = [...depressed];
-  surface.fold(.5);
-  const halfway = surface.mesh.getVerticesData('position')[center * 3 + 1];
-  surface.fold(1); surface.mesh.computeWorldMatrix(true);
-  const folded = surface.mesh.getVerticesData('position'), direction = family === 'inward' ? -1 : 1;
-  const roofChange = folded[center * 3 + 1] - crackedPositions[center * 3 + 1];
-  assert.ok(roofChange * direction > .05, 'the second stage must bend the actual roof in its selected direction');
-  assert.ok((halfway - crackedPositions[center * 3 + 1]) * direction > 0 && Math.abs(halfway - crackedPositions[center * 3 + 1]) < Math.abs(roofChange));
-  const footprint = [0, 2].map(axis => sourcePositions.filter((_, i) => i % 3 === axis));
-  const limits = footprint.map(values => [Math.min(...values), Math.max(...values)]);
-  for (let i = 0; i < folded.length; i += 3) {
-    for (const [j, axis] of [0, 2].entries()) assert.ok(folded[i + axis] >= limits[j][0] - 1e-9 && folded[i + axis] <= limits[j][1] + 1e-9, 'the bent roof must stay inside its original tile footprint');
-    if (sourcePositions[i + 1] <= 0) assert.ok(folded.slice(i, i + 3).every((v, j) => v === crackedPositions[i + j]), 'stage two must leave the existing lower ground stationary and intact');
-    if (sourcePositions[i + 1] <= -.20) assert.ok(folded.slice(i, i + 3).every((v, j) => v === sourcePositions[i + j]), 'deep soil and the underside must preserve the original geometry');
-  }
-  inspectSolid(surface.mesh);
-  let lean = 0, area = 0;
-  const indices = surface.mesh.getIndices(), top = source.subMeshes[0];
-  for (let i = top.indexStart; i < top.indexStart + top.indexCount; i += 3) {
-    const [a, b, c] = indices.slice(i, i + 3).map(id => Vector3.FromArray(folded, id * 3));
-    const middle = a.add(b).add(c).scale(1 / 3), radius = Math.hypot(middle.x, middle.z);
-    if (radius < .08 || radius > .32) continue;
-    const normal = Vector3.Cross(b.subtract(a), c.subtract(a)); if (normal.y < 0) normal.scaleInPlace(-1);
-    lean += (normal.x * middle.x + normal.z * middle.z) / radius; area += normal.length();
-  }
-  assert.ok(area > .01 && lean / area * direction > .05, 'actual roof faces must lean inward or outward, not merely change a state flag');
   assert.deepEqual(source.getVerticesData('position'), sourcePositions, 'subsidence cannot deform the intact source');
   surface.update(0);
   assert.ok(surface.mesh.getVerticesData('position').every((value, i) => value === sourcePositions[i]));
   assert.deepEqual(surface.mesh.getVerticesData('color'), sourceColors, 'resetting the damaged copy must also remove its local depression shading');
   assert.deepEqual(crack.getVerticesData('position'), crackPositions);
   surface.mesh.dispose();
+}
+
+function meshWorldPositions(mesh) {
+  const p = mesh.getVerticesData('position'), matrix = mesh.computeWorldMatrix(true);
+  return Array.from({ length: p.length / 3 }, (_, i) => Vector3.TransformCoordinates(Vector3.FromArray(p, i * 3), matrix));
+}
+
+function inspectSplitRoof(source, fragments, family) {
+  const saved = fragments.map(f => ({ p: [...f.mesh.getVerticesData('position')], n: [...f.mesh.getVerticesData('normal')], world: meshWorldPositions(f.mesh) }));
+  const split = createSplitRoof(fragments, family), direction = family === 'inward' ? -1 : 1;
+  const footprint = meshWorldPositions(source), low = [0, 2].map(axis => Math.min(...footprint.map(v => v.asArray()[axis]))), high = [0, 2].map(axis => Math.max(...footprint.map(v => v.asArray()[axis])));
+  // The authored .999-wide block leaves a tiny seam inside its 1-unit grid
+  // cell. Opening pieces may use that seam without entering the next cell.
+  const origin = source.getAbsolutePosition();
+  for (const [j, axis] of ['x', 'z'].entries()) {
+    low[j] = Math.min(low[j], origin[axis] - .5 * source.scaling[axis]);
+    high[j] = Math.max(high[j], origin[axis] + .5 * source.scaling[axis]);
+  }
+  const tilted = new Set();
+  for (const t of [0, .25, .5, .75, 1 - 1e-7, 1]) {
+    split.update(t);
+    fragments.forEach((f, i) => {
+      const world = meshWorldPositions(f.mesh);
+      if (f.supportLayer === 0) {
+        assert.ok(world.every((v, j) => Vector3.Distance(v, saved[i].world[j]) < 1e-8), 'the supporting soil must stay in its original resting position');
+      } else {
+        for (const v of world) for (const [j, axis] of ['x', 'z'].entries()) assert.ok(v[axis] >= low[j] - .0001 && v[axis] <= high[j] + .0001, `roof footprint tile=${source.metadata.tileIndex} family=${family} t=${t} axis=${axis} value=${v[axis]} bounds=${low[j]},${high[j]}`);
+        if (t === .75) {
+          const siblings = fragments.filter(part => part.supportGroup === f.supportGroup && part.supportLayer === 1);
+          const radial = siblings.reduce((sum, part) => sum.addInPlace(part.center.scale(part.volume)), Vector3.Zero()); radial.y = 0; radial.normalize();
+          const up = Vector3.TransformNormal(Vector3.Up(), f.root.computeWorldMatrix(true)).normalize();
+          if (Vector3.Dot(up, radial) * direction > .025) tilted.add(f.supportGroup);
+        }
+        if (t === 1 - 1e-7) saved[i].beforeBake = world;
+        if (t === 1) {
+          assert.ok(world.every((v, j) => Vector3.Distance(v, saved[i].beforeBake[j]) < 1e-5), 'baking the final split pose cannot pop a piece before the fall');
+          assert.ok(f.mesh.subMeshes.some(s => s.materialIndex === 2 && s.indexCount > 0), 'opened upper pieces require actual interior cut faces');
+        }
+      }
+    });
+  }
+  assert.ok(tilted.size >= 2, 'separate upper pieces must visibly tilt in the chosen direction');
+  fragments.forEach((f, i) => {
+    f.mesh.setVerticesData('position', saved[i].p); f.mesh.setVerticesData('normal', saved[i].n);
+    f.root.position.copyFrom(f.base); f.root.rotation.setAll(0); f.root.scaling.setAll(1);
+  });
+}
+
+function inspectTransport(source, result) {
+  const scene = source.getScene(), before = [scene.meshes.length, scene.transformNodes.length, scene.geometries.length];
+  const raw = snapshotFracture(result), buffers = fractureTransferables(raw);
+  const transported = structuredClone(raw, { transfer: buffers });
+  assert.ok(buffers.every(buffer => buffer.byteLength === 0), 'worker transfer should move only snapshot-owned buffers');
+  const restored = restoreFracture(source, transported);
+  for (const [i, original] of [result.crack, ...result.fragments.map(f => f.mesh)].entries()) {
+    const actual = [restored.crack, ...restored.fragments.map(f => f.mesh)][i];
+    for (const kind of original.getVerticesDataKinds()) assert.deepEqual(actual.getVerticesData(kind), original.getVerticesData(kind), `worker transport must preserve ${kind}`);
+    assert.deepEqual(actual.getIndices(), original.getIndices());
+    assert.deepEqual(actual.subMeshes.map(s => [s.materialIndex, s.indexStart, s.indexCount]), original.subMeshes.map(s => [s.materialIndex, s.indexStart, s.indexCount]));
+  }
+  restored.fragments.forEach((f, i) => {
+    assert.ok(!f.root.isEnabled(), 'hydrated pieces must remain hidden until their stage is displayed');
+    for (const [j, constraint] of f.columnConstraints.entries()) for (const point of [[-.3, -.2, .17], [.13, .2, -.23], [0, 0, 0]]) assert.equal(constraint.field(point), result.fragments[i].columnConstraints[j].field(point), 'serialized cut definitions must rebuild the same field');
+  });
+  restored.dispose();
+  assert.deepEqual([scene.meshes.length, scene.transformNodes.length, scene.geometries.length], before);
+  const crack = createFractureCrack(source, { variant: result.variant });
+  assert.equal(patternHash(crack, true), patternHash(result, true), 'the immediate crack must match the eventual worker partition');
+  assert.equal(crack.fragments.length, 0, 'the first click cannot synchronously build solid fragments');
+  crack.dispose();
 }
 
 test('rounded fragments have closed cut faces, bounded remeshing and preserved source attributes', () => {
@@ -279,6 +324,8 @@ test('rounded fragments have closed cut faces, bounded remeshing and preserved s
       // against the whole solid, independently of reported fragment metadata.
       const loss = (Math.abs(sourceVolume) - Math.abs(fragmentVolume)) / Math.abs(sourceVolume);
       assert.ok(loss >= -1e-6 && loss <= 0.12, 'rounded chunks must retain at least 88% of the original volume without inflation');
+      inspectTransport(source, result);
+      for (const family of ['inward', 'outward']) inspectSplitRoof(source, result.fragments, family);
       for (const [kind, values] of original) assert.deepEqual(source.getVerticesData(kind), values, `fracturing cannot change the restorable source ${kind}`);
       assert.deepEqual(source.getIndices(), originalIndices, 'fracturing cannot change the restorable source topology');
       result.dispose(); source.dispose();

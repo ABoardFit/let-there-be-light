@@ -38,7 +38,10 @@ function fractureSurface(plane,phase,vertical=false) {
   const [u,v]=planeBasis(plane);
   const height=(x,y)=>.032*Math.sin(x*15+phase)*Math.cos(y*12+phase*.73)+.014*Math.sin(x*24+y*8+phase*1.37);
   const sample=point=>vertical?[point[0],.245,point[2]]:point;
-  const field=point=>{const p=sample(point);return distance(p,plane)-height(dot(p,u),dot(p,v));};
+  const field=point=>{
+    const x=point[0],y=vertical?.245:point[1],z=point[2];
+    return x*plane[0]+y*plane[1]+z*plane[2]-plane[3]-height(x*u[0]+y*u[1]+z*u[2],x*v[0]+y*v[1]+z*v[2]);
+  };
   const project=point=>{
     const offset=field(point);for(let i=0;i<3;i++)point[i]-=plane[i]*offset;
     return point;
@@ -48,8 +51,9 @@ function fractureSurface(plane,phase,vertical=false) {
     const dv=vertical?0:-.384*Math.sin(x*15+phase)*Math.sin(y*12+phase*.73)+.112*Math.cos(x*24+y*8+phase*1.37);
     return unit(plane.slice(0,3).map((value,i)=>value-u[i]*du-v[i]*dv));
   };
-  return {field,project,normal};
+  return {field,project,normal,definition:{plane,phase,vertical}};
 }
+export const fractureFieldFromDefinition=({plane,phase,vertical})=>fractureSurface(plane,phase,vertical).field;
 
 function sourceSampler(faces) {
   const bounds=items=>{
@@ -58,7 +62,7 @@ function sourceSampler(faces) {
     return {min,max};
   };
   const build=items=>{
-    const node=bounds(items);if(items.length<=10){node.faces=items;return node;}
+    const node=bounds(items);node.materials=items.reduce((mask,face)=>mask|(1<<face.mat),0);if(items.length<=10){node.faces=items;return node;}
     const extent=node.max.map((v,j)=>v-node.min[j]),axis=extent.indexOf(Math.max(...extent));
     items.sort((a,b)=>a.v.reduce((s,v)=>s+v[axis],0)-b.v.reduce((s,v)=>s+v[axis],0));
     const half=Math.floor(items.length/2);node.left=build(items.slice(0,half));node.right=build(items.slice(half));return node;
@@ -77,43 +81,51 @@ function sourceSampler(faces) {
     };visit(tree);hits.sort((a,b)=>a-b);
     const result=hits.filter((v,i)=>!i||v-hits[i-1]>1e-7);columns.set(id,result);return result;
   };
-  const subtract=(a,b)=>a.slice(0,3).map((v,j)=>v-b[j]);
-  const closest=(p,face)=>{
-    const [a,b,c]=face.v,ab=subtract(b,a),ac=subtract(c,a),ap=subtract(p,a),d1=dot(ab,ap),d2=dot(ac,ap);let weights;
-    if(d1<=0&&d2<=0)weights=[1,0,0];
+  // Millions of rejected triangle candidates need only scalar arithmetic.
+  // Allocate barycentric attributes only when a candidate actually wins.
+  const closest=(p,face,best)=>{
+    const [a,b,c]=face.v;
+    const abx=b[0]-a[0],aby=b[1]-a[1],abz=b[2]-a[2],acx=c[0]-a[0],acy=c[1]-a[1],acz=c[2]-a[2];
+    const apx=p[0]-a[0],apy=p[1]-a[1],apz=p[2]-a[2];
+    const d1=abx*apx+aby*apy+abz*apz,d2=acx*apx+acy*apy+acz*apz;let w0,w1,w2;
+    if(d1<=0&&d2<=0){w0=1;w1=0;w2=0;}
     else {
-      const bp=subtract(p,b),d3=dot(ab,bp),d4=dot(ac,bp);
-      if(d3>=0&&d4<=d3)weights=[0,1,0];
+      const bpx=p[0]-b[0],bpy=p[1]-b[1],bpz=p[2]-b[2],d3=abx*bpx+aby*bpy+abz*bpz,d4=acx*bpx+acy*bpy+acz*bpz;
+      if(d3>=0&&d4<=d3){w0=0;w1=1;w2=0;}
       else {
         const vc=d1*d4-d3*d2;
-        if(vc<=0&&d1>=0&&d3<=0){const v=d1/(d1-d3);weights=[1-v,v,0];}
+        if(vc<=0&&d1>=0&&d3<=0){const v=d1/(d1-d3);w0=1-v;w1=v;w2=0;}
         else {
-          const cp=subtract(p,c),d5=dot(ab,cp),d6=dot(ac,cp);
-          if(d6>=0&&d5<=d6)weights=[0,0,1];
+          const cpx=p[0]-c[0],cpy=p[1]-c[1],cpz=p[2]-c[2],d5=abx*cpx+aby*cpy+abz*cpz,d6=acx*cpx+acy*cpy+acz*cpz;
+          if(d6>=0&&d5<=d6){w0=0;w1=0;w2=1;}
           else {
             const vb=d5*d2-d1*d6;
-            if(vb<=0&&d2>=0&&d6<=0){const w=d2/(d2-d6);weights=[1-w,0,w];}
+            if(vb<=0&&d2>=0&&d6<=0){const w=d2/(d2-d6);w0=1-w;w1=0;w2=w;}
             else {
               const va=d3*d6-d5*d4;
-              if(va<=0&&d4-d3>=0&&d5-d6>=0){const w=(d4-d3)/((d4-d3)+(d5-d6));weights=[0,1-w,w];}
-              else {const inv=1/(va+vb+vc),v=vb*inv,w=vc*inv;weights=[1-v-w,v,w];}
+              if(va<=0&&d4-d3>=0&&d5-d6>=0){const w=(d4-d3)/((d4-d3)+(d5-d6));w0=0;w1=1-w;w2=w;}
+              else {const inv=1/(va+vb+vc),v=vb*inv,w=vc*inv;w0=1-v-w;w1=v;w2=w;}
             }
           }
         }
       }
     }
-    const point=[0,1,2].map(i=>a[i]*weights[0]+b[i]*weights[1]+c[i]*weights[2]);
-    return {weights,face,distanceSquared:subtract(point,p).reduce((sum,v)=>sum+v*v,0)};
+    const dx=a[0]*w0+b[0]*w1+c[0]*w2-p[0],dy=a[1]*w0+b[1]*w1+c[1]*w2-p[1],dz=a[2]*w0+b[2]*w1+c[2]*w2-p[2];
+    const distanceSquared=dx*dx+dy*dy+dz*dz;
+    if(distanceSquared<best.distanceSquared){best.distanceSquared=distanceSquared;best.face=face;best.weights=[w0,w1,w2];}
   };
-  const boxDistance=(node,p)=>p.slice(0,3).reduce((sum,v,j)=>sum+Math.max(node.min[j]-v,0,v-node.max[j])**2,0);
+  const boxDistance=(node,p)=>{
+    const x=Math.max(node.min[0]-p[0],0,p[0]-node.max[0]),y=Math.max(node.min[1]-p[1],0,p[1]-node.max[1]),z=Math.max(node.min[2]-p[2],0,p[2]-node.max[2]);
+    return x*x+y*y+z*z;
+  };
   const nearest=(p,material=null)=>{
-    let best={distanceSquared:Infinity};
-    const visit=node=>{
-      if(boxDistance(node,p)>best.distanceSquared)return;
-      if(node.faces){for(const face of node.faces){if(material!==null&&face.mat!==material)continue;const hit=closest(p,face);if(hit.distanceSquared<best.distanceSquared)best=hit;}return;}
-      const first=boxDistance(node.left,p)<boxDistance(node.right,p)?node.left:node.right;
-      visit(first);visit(first===node.left?node.right:node.left);
-    };visit(tree);
+    const best={distanceSquared:Infinity};
+    const visit=(node,distanceSquared)=>{
+      if(distanceSquared>best.distanceSquared||(material!==null&&!(node.materials&(1<<material))))return;
+      if(node.faces){for(const face of node.faces){if(material!==null&&face.mat!==material)continue;closest(p,face,best);}return;}
+      const left=boxDistance(node.left,p),right=boxDistance(node.right,p);
+      if(left<right){visit(node.left,left);visit(node.right,right);}else{visit(node.right,right);visit(node.left,left);}
+    };visit(tree,boxDistance(tree,p));
     const [a,b,c]=best.face.v,w=best.weights;
     best.value=a.map((_,i)=>a[i]*w[0]+b[i]*w[1]+c[i]*w[2]);return best;
   };
@@ -122,6 +134,7 @@ function sourceSampler(faces) {
 
 function roundedFragment(piece,sampler,interiorOffset) {
   const radius=Math.min(.05,Math.min(...piece.extent)*.18),spacing=radius/4.2,padding=radius+spacing*2;
+  const columnCuts=piece.constraints.filter(c=>c.cutId<3),volumeCuts=piece.constraints.filter(c=>c.cutId>=3);
   const start=piece.min.map(v=>Math.floor((v-padding)/spacing)),end=piece.max.map(v=>Math.ceil((v+padding)/spacing));
   let nx,ny,nz,origin,occupancy;
   // Partition samples estimate bounds; a curved cut can include source voxels
@@ -130,12 +143,14 @@ function roundedFragment(piece,sampler,interiorOffset) {
     [nx,ny,nz]=end.map((v,j)=>v-start[j]+1);origin=start.map(v=>v*spacing);occupancy=new Uint8Array(nx*ny*nz);
     const touches=[false,false,false,false,false,false];
     for(let z=0;z<nz;z++)for(let x=0;x<nx;x++){
-      const px=origin[0]+x*spacing,pz=origin[2]+z*spacing,hits=sampler.column(px,pz);if(hits.length<2)continue;
+      const px=origin[0]+x*spacing,pz=origin[2]+z*spacing;
+      if(columnCuts.some(c=>c.surface.field([px,0,pz])*c.side>0))continue;
+      const hits=sampler.column(px,pz);if(hits.length<2)continue;
       for(let y=0;y<ny;y++){
         const py=origin[1]+y*spacing;let inside=false;
         for(let j=0;j+1<hits.length;j+=2)if(py>=hits[j]&&py<=hits[j+1]){inside=true;break;}
         if(!inside)continue;
-        const point=[px,py,pz];if(piece.constraints.every(c=>c.surface.field(point)*c.side<=0)){
+        const point=[px,py,pz];if(volumeCuts.every(c=>c.surface.field(point)*c.side<=0)){
           occupancy[x+nx*(y+ny*z)]=1;
           if(x===0)touches[0]=true;if(x===nx-1)touches[1]=true;
           if(y===0)touches[2]=true;if(y===ny-1)touches[3]=true;
@@ -228,7 +243,8 @@ export function fractureBlock(source, options = {}) {
     throw error;
   }
 }
-function buildFracture(source, {variant=0} = {}) {
+export const createFractureCrack=(source,options={})=>fractureBlock(source,{...options,crackOnly:true});
+function buildFracture(source, {variant=0,crackOnly=false} = {}) {
   if(!Number.isInteger(variant)||variant<0||variant>0xffffffff)throw new RangeError('Fracture variant must be an unsigned 32-bit integer.');
   const scene=source.getScene(),position=source.getVerticesData('position'),normal=source.getVerticesData('normal'),uv=source.getVerticesData('uv'),color=source.getVerticesData('color'),stone=source.getVerticesData('terrainStoneUV'),bottom=source.getVerticesData('terrainBottomLight');
   const vertices=Array.from({length:position.length/3},(_,i)=>[...position.slice(i*3,i*3+3),...normal.slice(i*3,i*3+3),...uv.slice(i*2,i*2+2),...color.slice(i*4,i*4+4),...stone.slice(i*2,i*2+2),bottom[i]]);
@@ -317,11 +333,11 @@ function buildFracture(source, {variant=0} = {}) {
     }
   }
 
-  for(let part=0;part<pieces.length;part++){
+  for(let part=0;!crackOnly&&part<pieces.length;part++){
     const rounded=roundedFragment(pieces[part],sampler,interiorOffset),faces=rounded.faces;
     const {center:centroid,volume,topArea,min,max}=measure(faces), center=new Vector3(...centroid);
     const supportGroup=pieces[part].constraints.filter(c=>c.cutId<3).map(c=>`${c.cutId}:${c.side}`).join('|');
-    const columnConstraints=pieces[part].constraints.filter(c=>c.cutId<3).map(c=>({cutId:c.cutId,side:c.side,field:c.surface.field}));
+    const columnConstraints=pieces[part].constraints.filter(c=>c.cutId<3).map(c=>({cutId:c.cutId,side:c.side,field:c.surface.field,definition:c.surface.definition}));
     const heightCut=pieces[part].constraints.find(c=>c.cutId>=3&&c.cutId<7);
     const supportLayer=heightCut.side===1?0:1;
     const p=[],n=[],u=[],c=[],s=[],light=[],indices=[],vertexIds=new Map();
