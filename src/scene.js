@@ -2,6 +2,7 @@ import { sampleContactTimeline } from './contact-preparer.js';
 import { loadFractureCatalog, getFractureTemplate } from './fracture-catalog.js';
 import { restoreFracture, restoreFractureMesh } from './fracture-data.js';
 import { enableFragmentFade } from './fragment-fade.js';
+import { createTerrainDust } from './terrain-dust.js';
 import { createNineSliceBlock } from './terrain.js';
 export { createNineSliceBlock, nineSliceAxis } from './terrain.js';
 import { Engine } from '@babylonjs/core/Engines/engine.js';
@@ -937,6 +938,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   };
 
   const animations = new Set();
+  const terrainDust = createTerrainDust(scene, { reducedMotion, glow });
   const animate = (duration, update) => new Promise((resolve) => {
     if (disposed) { resolve(); return; }
     const job = { started: performance.now(), duration: reducedMotion ? Math.min(duration, 140) : duration, update, resolve };
@@ -1147,7 +1149,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     let damageDisposed = false;
     damage.dispose = () => {
       if (damageDisposed) return;
-      damageDisposed = true; damage.releaseCrackedShell?.(); damage.splitRoof?.dispose();
+      damageDisposed = true; terrainDust.clear(tile.parent); damage.releaseCrackedShell?.(); damage.splitRoof?.dispose();
       const meshes = new Set(damage.allFragments.map(({ mesh }) => mesh));
       soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter(mesh => !meshes.has(mesh));
       meshes.forEach(mesh => { shadows.removeShadowCaster(mesh, false); glow.removeExcludedMesh(mesh); });
@@ -1171,6 +1173,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     return damage.splitPreparing;
   };
   const resetTerrainDamage = (terrain) => {
+    terrainDust.clear();
     const nextPatterns = chooseFracturePatterns(terrain.size, patternSequence++, terrain.patternIds);
     terrain.damage.forEach((damage, i) => {
       damage?.dispose(); terrain.damage[i] = null; terrain.stages[i] = 0;
@@ -1220,8 +1223,10 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
         tile.setEnabled(false);
         terrain.details.filter((mesh) => mesh.parent === terrain.tileRoots[index]).forEach((mesh) => mesh.setEnabled(false));
         void prepareBakedSplit(terrain, index, damage);
+        let dustStarted = false;
         await animate(420, (t) => {
           const progress = ease(t); surface.update(progress); damage.crack.visibility = progress;
+          if (!dustStarted && t >= 0.06) { terrainDust.emit(damage.crack, 1, damage.patternId ?? index); dustStarted = true; }
           damage.crackedDepression = surface.depth * progress;
           if (terrain === battleTerrain) actors.forEach(actor => { if (actor.data.tile === index) actor.root.position.copyFrom(coord(index)); });
         });
@@ -1229,7 +1234,11 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
         if (!await prepareBakedSplit(terrain, index, damage)) return false;
         damage.fragments.forEach(({ root }) => root.setEnabled(true));
         damage.releaseCrackedShell?.(); damage.crack.setEnabled(false);
-        await animate(420, (t) => { damage.splitRoof.update(ease(t)); });
+        let dustStarted = false;
+        await animate(420, (t) => {
+          damage.splitRoof.update(ease(t));
+          if (!dustStarted && t >= 0.08) { terrainDust.emit(damage.crack, 2, damage.patternId ?? index); dustStarted = true; }
+        });
       } else {
         const family = damage.surface.family, parents = damage.fragments;
         const replaced = new Set(damage.secondaryFragments.map(f => f.parentPart));
@@ -1239,9 +1248,10 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
         damage.fragments.forEach(({ mesh }, part) => { mesh.metadata.collapseMotion = damage.motion[part]; });
         damage.releaseCrackedShell?.(); damage.crackedDepression = 0;
         damage.crack.setEnabled(false); sync(latestState); setFocus(null);
-        let handedOff = false;
+        let handedOff = false, dustStarted = false;
         const starts = damage.fragments.map(({ root }) => ({ position: root.position.clone(), rotation: root.rotation.clone() }));
         await animate(1200, (t) => {
+          if (!dustStarted && t >= 0.08) { terrainDust.emit(damage.crack, 3, damage.patternId ?? index); dustStarted = true; }
           if (!handedOff && t >= .08) { parents.filter(f => replaced.has(f.part)).forEach(f => f.root.setEnabled(false)); damage.secondaryFragments.forEach(f => f.root.setEnabled(true)); handedOff = true; }
           damage.fragments.forEach(({ root, mesh }, i) => {
             const start = starts[i], motion = damage.motion[i];
@@ -1262,6 +1272,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   };
   const resetBoardView = async () => {
     if (disposed || busy || viewBusy) return false;
+    terrainDust.clear();
     const terrain = activeTerrain(), heights = [...terrain.heights];
     const start = rotation > 180 ? rotation - 360 : rotation;
     viewBusy = true; dropMode = false; down = null; hovered = null; notifyViewState();
@@ -1383,6 +1394,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     if (disposed || busy || viewBusy) return false;
     if (size !== null && (!Number.isInteger(size) || size < 1 || size > 5)) throw new RangeError('Board preview size must be 1 through 5, or null.');
     if (size === boardPreviewSize) return true;
+    terrainDust.clear();
     rotation = 0; boardRoot.rotation.y = 0; dropMode = false; keyboardFocus = null; hovered = null; down = null;
     battleTerrain.heights.forEach((_, i) => updateTileHeight(battleTerrain, i, 0));
     resetTerrainDamage(battleTerrain);
@@ -1420,6 +1432,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       const t = clamp((now - job.started) / job.duration); job.update(t);
       if (t >= 1) { animations.delete(job); job.resolve(); }
     });
+    terrainDust.update(now);
     actors.forEach(updateActorBillboard);
     scene.render();
     if (boardPreviewSize !== null) return;
@@ -1464,6 +1477,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     });
   };
   const warmTemplate = getFractureTemplate(0), warmSource = groundTiles[0];
+  await terrainDust.warm();
   const warmDamage = restoreFracture(warmSource, warmTemplate.fracture);
   const warmShell = createBakedCrackedSurface(warmSource, warmDamage.crack, warmTemplate.stages, warmTemplate.family).mesh;
   warmShell.setEnabled(false);
@@ -1502,6 +1516,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     rotateBoard, setTileDropMode, toggleTileDrop, resetBoardView, getBoardViewState, moveFocusTile, isTileAvailable,
     dispose() {
       disposed = true;  observer.disconnect(); engine.stopRenderLoop(render);
+      terrainDust.dispose();
       previewTerrain?.dispose(); previewTerrain = null;
       labelsRoot.style.visibility = savedLabelVisibility;
       animations.forEach((job) => job.resolve()); animations.clear();
