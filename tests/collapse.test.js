@@ -215,12 +215,18 @@ function inspectCrackedSurface(source, crack, family) {
 }
 
 function meshWorldPositions(mesh) {
-  const p = mesh.getVerticesData('position'), matrix = mesh.computeWorldMatrix(true);
+  const base = mesh.getVerticesData('position'), p = [...base], matrix = mesh.computeWorldMatrix(true);
+  const manager = mesh.morphTargetManager;
+  for (let i = 0; manager && i < manager.numTargets; i++) {
+    const target = manager.getTarget(i), positions = target.getPositions();
+    if (positions) for (let j = 0; j < p.length; j++) p[j] += (positions[j] - base[j]) * target.influence;
+  }
   return Array.from({ length: p.length / 3 }, (_, i) => Vector3.TransformCoordinates(Vector3.FromArray(p, i * 3), matrix));
 }
 
 function inspectSplitRoof(source, fragments, family) {
   const saved = fragments.map(f => ({ p: [...f.mesh.getVerticesData('position')], n: [...f.mesh.getVerticesData('normal')], world: meshWorldPositions(f.mesh) }));
+  const initialManagers = source.getScene().morphTargetManagers.length;
   const split = createSplitRoof(fragments, family), direction = family === 'inward' ? -1 : 1;
   const footprint = meshWorldPositions(source), low = [0, 2].map(axis => Math.min(...footprint.map(v => v.asArray()[axis]))), high = [0, 2].map(axis => Math.max(...footprint.map(v => v.asArray()[axis])));
   // The authored .999-wide block leaves a tiny seam inside its 1-unit grid
@@ -235,25 +241,45 @@ function inspectSplitRoof(source, fragments, family) {
     split.update(t);
     fragments.forEach((f, i) => {
       const world = meshWorldPositions(f.mesh);
-      if (f.supportLayer === 0) {
-        assert.ok(world.every((v, j) => Vector3.Distance(v, saved[i].world[j]) < 1e-8), 'the supporting soil must stay in its original resting position');
-      } else {
+      const anchor = f.mesh.metadata.roofSplit.anchor;
+      assert.ok(world.every((v, j) => saved[i].p[j * 3 + 1] > anchor || Vector3.Distance(v, saved[i].world[j]) < 1e-8), 'the anchored foot of each soil column must remain stationary');
+      if (f.supportLayer === 1) {
         for (const v of world) for (const [j, axis] of ['x', 'z'].entries()) assert.ok(v[axis] >= low[j] - .0001 && v[axis] <= high[j] + .0001, `roof footprint tile=${source.metadata.tileIndex} family=${family} t=${t} axis=${axis} value=${v[axis]} bounds=${low[j]},${high[j]}`);
         if (t === .75) {
           const siblings = fragments.filter(part => part.supportGroup === f.supportGroup && part.supportLayer === 1);
           const radial = siblings.reduce((sum, part) => sum.addInPlace(part.center.scale(part.volume)), Vector3.Zero()); radial.y = 0; radial.normalize();
-          const up = Vector3.TransformNormal(Vector3.Up(), f.root.computeWorldMatrix(true)).normalize();
-          if (Vector3.Dot(up, radial) * direction > .025) tilted.add(f.supportGroup);
+          let lean = 0, area = 0;
+          const indices = f.mesh.getIndices();
+          for (const sub of f.mesh.subMeshes.filter(s => s.materialIndex === 0)) for (let j = sub.indexStart; j < sub.indexStart + sub.indexCount; j += 3) {
+            const ids = indices.slice(j, j + 3), [a, b, c] = ids.map(id => saved[i].world[id]);
+            const before = Vector3.Cross(b.subtract(a), c.subtract(a)).normalize(); if (before.y < 0) before.scaleInPlace(-1);
+            if (before.y < .9999) continue;
+            const [x, y, z] = ids.map(id => world[id]), after = Vector3.Cross(y.subtract(x), z.subtract(x)); if (after.y < 0) after.scaleInPlace(-1);
+            const weight = after.length(); after.normalize();
+            lean += Vector3.Dot(after.subtract(before), radial) * weight; area += weight;
+          }
+          if (area > .001 && lean / area * direction > .008) tilted.add(f.supportGroup);
         }
         if (t === 1 - 1e-7) saved[i].beforeBake = world;
         if (t === 1) {
           assert.ok(world.every((v, j) => Vector3.Distance(v, saved[i].beforeBake[j]) < 1e-5), 'baking the final split pose cannot pop a piece before the fall');
           assert.ok(f.mesh.subMeshes.some(s => s.materialIndex === 2 && s.indexCount > 0), 'opened upper pieces require actual interior cut faces');
+          let beforeArea = 0, afterArea = 0;
+          const indices = f.mesh.getIndices();
+          for (const sub of f.mesh.subMeshes.filter(s => s.materialIndex === 0)) for (let j = sub.indexStart; j < sub.indexStart + sub.indexCount; j += 3) {
+            const ids = indices.slice(j, j + 3);
+            const areaXZ = points => { const [a,b,c] = ids.map(id => points[id]); return Math.abs((b.x-a.x)*(c.z-a.z)-(b.z-a.z)*(c.x-a.x)); };
+            beforeArea += areaXZ(saved[i].world); afterArea += areaXZ(world);
+          }
+          if (beforeArea > .005) assert.ok(afterArea / beforeArea >= .84, 'the mild split must retain most of its grass standing area');
+          assert.ok(world.every((v, j) => saved[i].p[j * 3 + 1] < .15 || Math.abs(v.y - saved[i].world[j].y) < .08), 'roof fragments cannot rise into separate high platforms');
         }
       }
     });
   }
   assert.ok(tilted.size >= 2, 'separate upper pieces must visibly tilt in the chosen direction');
+  assert.equal(source.getScene().morphTargetManagers.length, initialManagers, 'baking must release every temporary morph target manager');
+  split.dispose();
   fragments.forEach((f, i) => {
     f.mesh.setVerticesData('position', saved[i].p); f.mesh.setVerticesData('normal', saved[i].n);
     f.root.position.copyFrom(f.base); f.root.rotation.setAll(0); f.root.scaling.setAll(1);

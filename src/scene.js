@@ -20,7 +20,8 @@ import { MultiMaterial } from '@babylonjs/core/Materials/multiMaterial.js';
 import { DynamicTexture } from '@babylonjs/core/Materials/Textures/dynamicTexture.js';
 import { Texture } from '@babylonjs/core/Materials/Textures/texture.js';
 import { Mesh } from '@babylonjs/core/Meshes/mesh.js';
-import { SubMesh } from '@babylonjs/core/Meshes/subMesh.js';
+import { MorphTarget } from '@babylonjs/core/Morph/morphTarget.js';
+import { MorphTargetManager } from '@babylonjs/core/Morph/morphTargetManager.js';
 import '@babylonjs/core/Meshes/instancedMesh.js';
 import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData.js';
 import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
@@ -336,8 +337,8 @@ function bendFragments(fragments, surface) {
   }
 }
 
-// Open the existing fracture boundaries. Each roof column keeps a common
-// transform; the supporting soil is displayed in its untouched resting pose.
+// A fracture column bends continuously through turf and soil. The motion fades
+// to zero near the foot, so no independent roof slab or horizontal ledge forms.
 export function createSplitRoof(fragments, family) {
   const groups = new Map();
   for (const f of fragments) {
@@ -346,70 +347,70 @@ export function createSplitRoof(fragments, family) {
   }
   const changes = [];
   for (const group of groups.values()) {
-    const upper = group.filter(f => f.supportLayer === 1), lower = group.filter(f => f.supportLayer === 0);
+    const upper = group.filter(f => f.supportLayer === 1);
     const volume = upper.reduce((v, f) => v + f.volume, 0);
     const center = upper.reduce((v, f) => v.addInPlace(f.center.scale(f.volume)), Vector3.Zero()).scaleInPlace(1 / volume);
-    const first = upper[0], scale = first.mesh.scaling, origin = first.base.add(first.mesh.position), pivot = center.multiply(scale).add(origin);
-    const radial = new Vector3(center.x, 0, center.z).normalize();
-    const axis = Math.abs(radial.x) >= Math.abs(radial.z) ? 'z' : 'x';
-    const sign = (axis === 'z' ? -Math.sign(radial.x) : Math.sign(radial.z)) * (family === 'inward' ? -1 : 1);
-    const shrink = .84, desired = .26;
-    const records = upper.map(f => ({ f, p: [...f.mesh.getVerticesData('position')], n: [...f.mesh.getVerticesData('normal')] }));
+    const first = upper[0], scale = first.mesh.scaling, origin = first.base.add(first.mesh.position);
+    const pivot = new Vector3(center.x * scale.x + origin.x, .12 * scale.y + origin.y, center.z * scale.z + origin.z);
+    const axis = Math.abs(center.x) >= Math.abs(center.z) ? 'z' : 'x';
+    const sign = (axis === 'z' ? -Math.sign(center.x) : Math.sign(center.z)) * (family === 'inward' ? -1 : 1);
+    const records = group.map(f => ({ f, p: [...f.mesh.getVerticesData('position')], n: [...f.mesh.getVerticesData('normal')] }));
+    const minimum = Math.min(...group.map(f => f.bounds.min[1]));
+    const anchor = minimum + (.245 - minimum) * .22;
+    const shrink = .945, desired = .075, lift = .008;
+    const weightAt = y => { const t = clamp(((y - origin.y) / scale.y - anchor) / (.245 - anchor)); return t * t * (3 - 2 * t); };
     const transform = (x, y, z, angle) => {
-      const dx = (x - pivot.x) * shrink, dy = y - pivot.y, dz = (z - pivot.z) * shrink;
-      const c = Math.cos(angle), sn = Math.sin(angle);
-      return axis === 'z' ? [dx * c - dy * sn + pivot.x, dx * sn + dy * c + pivot.y, dz + pivot.z]
-        : [dx + pivot.x, dy * c - dz * sn + pivot.y, dy * sn + dz * c + pivot.z];
+      const weight = weightAt(y), contraction = 1 + (shrink - 1) * weight;
+      const dx = (x - pivot.x) * contraction, dy = y - pivot.y, dz = (z - pivot.z) * contraction;
+      const c = Math.cos(angle * weight), sn = Math.sin(angle * weight);
+      return axis === 'z' ? [dx * c - dy * sn + pivot.x, dx * sn + dy * c + pivot.y + lift * weight, dz + pivot.z]
+        : [dx + pivot.x, dy * c - dz * sn + pivot.y + lift * weight, dy * sn + dz * c + pivot.z];
     };
     const valid = amount => {
       for (const { f, p } of records) for (let i = 0; i < p.length; i += 3) {
         const q = transform(p[i] * scale.x + origin.x, p[i + 1] * scale.y + origin.y, p[i + 2] * scale.z + origin.z, amount * sign);
         const local = [(q[0] - origin.x) / scale.x, 0, (q[2] - origin.z) / scale.z];
         if (Math.abs(local[0]) > .50 || Math.abs(local[2]) > .50) return false;
-        if (f.columnConstraints.some(c => c.field(local) * c.side > .004)) return false;
+        if (f.columnConstraints.some(c => c.field(local) * c.side > .007)) return false;
       }
       return true;
     };
     let lo = 0, hi = desired;
-    for (let i = 0; i < 9; i++) { const middle = (lo + hi) / 2; if (valid(middle)) lo = middle; else hi = middle; }
+    for (let i = 0; i < 8; i++) { const middle = (lo + hi) / 2; if (valid(middle)) lo = middle; else hi = middle; }
     const angle = lo * sign;
-    let floor = -Infinity, minimum = Infinity;
-    for (const f of lower) { const p = f.mesh.getVerticesData('position'); for (let i = 1; i < p.length; i += 3) floor = Math.max(floor, p[i] * scale.y + origin.y); }
-    for (const { p } of records) for (let i = 0; i < p.length; i += 3) minimum = Math.min(minimum,
-      transform(p[i] * scale.x + origin.x, p[i + 1] * scale.y + origin.y, p[i + 2] * scale.z + origin.z, angle)[1]);
-    const lift = Math.max(.04, floor + .025 - minimum);
-    const rotation = axis === 'x' ? Matrix.RotationX(angle) : Matrix.RotationZ(angle);
     for (const { f, p, n } of records) {
       const target = [...p], targetNormals = [...n];
       for (let i = 0; i < p.length; i += 3) {
-        const q = transform(p[i] * scale.x + origin.x, p[i + 1] * scale.y + origin.y, p[i + 2] * scale.z + origin.z, angle);
-        target[i] = (q[0] - origin.x) / scale.x; target[i + 1] = (q[1] + lift - origin.y) / scale.y; target[i + 2] = (q[2] - origin.z) / scale.z;
-        const normal = Vector3.TransformNormal(new Vector3(n[i] / (shrink * scale.x), n[i + 1] / scale.y, n[i + 2] / (shrink * scale.z)), rotation)
-          .multiply(scale).normalize();
+        const x = p[i] * scale.x + origin.x, y = p[i + 1] * scale.y + origin.y, z = p[i + 2] * scale.z + origin.z;
+        const q = transform(x, y, z, angle), h = .0001;
+        target[i] = (q[0] - origin.x) / scale.x; target[i + 1] = (q[1] - origin.y) / scale.y; target[i + 2] = (q[2] - origin.z) / scale.z;
+        const derivative = (a, b) => new Vector3((a[0]-b[0])/(2*h), (a[1]-b[1])/(2*h), (a[2]-b[2])/(2*h));
+        const jx = derivative(transform(x+h,y,z,angle), transform(x-h,y,z,angle));
+        const jy = derivative(transform(x,y+h,z,angle), transform(x,y-h,z,angle));
+        const jz = derivative(transform(x,y,z+h,angle), transform(x,y,z-h,angle));
+        const normal = Vector3.Cross(jy,jz).scale(n[i]/scale.x)
+          .addInPlace(Vector3.Cross(jz,jx).scale(n[i+1]/scale.y))
+          .addInPlace(Vector3.Cross(jx,jy).scale(n[i+2]/scale.z)).multiply(scale).normalize();
         targetNormals.splice(i, 3, normal.x, normal.y, normal.z);
       }
-      f.mesh.setVerticesData('position', p, true); f.mesh.setVerticesData('normal', n, true);
-      f.mesh.metadata.roofSplit = { family, axis, angle, shrink, lift };
-      changes.push({ mesh: f.mesh, root: f.root, base: f.base, pivot, axis, angle, shrink, lift, target, targetNormals });
+      const manager = new MorphTargetManager(f.mesh.getScene()), morph = new MorphTarget(`${f.mesh.name}-supported-bend`, 0, f.mesh.getScene());
+      manager.optimizeInfluencers = false; morph.setPositions(target); morph.setNormals(targetNormals); manager.addTarget(morph); f.mesh.morphTargetManager = manager;
+      f.mesh.metadata.roofSplit = { family, axis, angle, shrink, lift, anchor, connectedBody: true };
+      changes.push({ mesh: f.mesh, target, targetNormals, manager, morph, baked: false });
     }
   }
+  const release = change => {
+    if (!change.manager) return;
+    change.mesh.morphTargetManager = null; change.manager.dispose(); change.manager = null;
+  };
   return { update(progress) {
-    for (const { mesh, root, base, pivot, axis, angle, shrink, lift, target, targetNormals } of changes) {
+    for (const change of changes) {
+      if (change.baked) continue;
       if (progress >= 1) {
-        mesh.updateVerticesData('position', target, true); mesh.updateVerticesData('normal', targetNormals);
-        root.position.copyFrom(base); root.rotation.setAll(0); root.scaling.setAll(1);
-        continue;
-      }
-      const opening = clamp(progress / .45), turning = clamp((progress - .3) / .7);
-      const scale = 1 + (shrink - 1) * opening;
-      const rotation = axis === 'x' ? Matrix.RotationX(angle * turning) : Matrix.RotationZ(angle * turning);
-      const relative = base.subtract(pivot).multiply(new Vector3(scale, 1, scale));
-      root.position.copyFrom(pivot).addInPlace(Vector3.TransformCoordinates(relative, rotation));
-      root.position.y += lift * opening;
-      root.rotation.setAll(0); root.rotation[axis] = angle * turning;
-      root.scaling.set(scale, 1, scale);
+        release(change); change.mesh.setVerticesData('position', change.target); change.mesh.setVerticesData('normal', change.targetNormals); change.baked = true;
+      } else change.morph.influence = progress;
     }
-  } };
+  }, dispose() { changes.forEach(release); } };
 }
 
 function noise(x, y) {
@@ -1126,7 +1127,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       if (damageDisposed) return;
       damageDisposed = true;
       damage.releaseCrackedShell?.();
-      damage.releaseFoundation?.();
+      damage.splitRoof?.dispose();
       const meshes = new Set(damage.fragments.map(({ mesh }) => mesh));
       soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter((mesh) => !meshes.has(mesh));
       meshes.forEach((mesh) => { shadows.removeShadowCaster(mesh, false); glow.removeExcludedMesh(mesh); });
@@ -1186,32 +1187,11 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       } else if (next === 2) {
         bendFragments(damage.fragments, damage.surface);
         damage.splitRoof = createSplitRoof(damage.fragments, damage.surface.family);
-        // Preserve the original lower silhouette and artwork. Internal lower
-        // caps support the opened roof, while their remeshed exterior is hidden.
-        const foundation = tile.clone(`${tile.name}-intact-foundation`, tile.parent, true);
-        foundation.metadata = { tileIndex: index, intactFoundation: true };
-        const body = tile.subMeshes[1];
-        foundation.releaseSubMeshes();
-        new SubMesh(body.materialIndex, body.verticesStart, body.verticesCount, body.indexStart, body.indexCount, foundation);
-        foundation.setEnabled(true);
-        shadows.addShadowCaster(foundation); glow.addExcludedMesh(foundation); soilFill.includedOnlyMeshes.push(foundation);
-        const restoreSubMeshes = [];
-        damage.fragments.filter(f => f.supportLayer === 0).forEach(({ mesh }) => {
-          const ranges = mesh.subMeshes.map(m => [m.materialIndex, m.verticesStart, m.verticesCount, m.indexStart, m.indexCount]);
-          mesh.releaseSubMeshes(); new SubMesh(...ranges[2], mesh);
-          restoreSubMeshes.push(() => { mesh.releaseSubMeshes(); ranges.forEach(range => new SubMesh(...range, mesh)); });
-        });
-        damage.releaseFoundation = () => {
-          if (foundation.isDisposed()) return;
-          shadows.removeShadowCaster(foundation, false); glow.removeExcludedMesh(foundation);
-          soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter(mesh => mesh !== foundation);
-          foundation.dispose(false, false); restoreSubMeshes.forEach(restore => restore());
-        };
         damage.fragments.forEach(({ root }) => root.setEnabled(true));
         damage.releaseCrackedShell?.(); damage.crack.setEnabled(false);
         await animate(700, (t) => { damage.splitRoof.update(ease(t)); });
       } else {
-        damage.releaseFoundation?.();
+        damage.splitRoof?.dispose();
         const family = damage.surface.family;
         damage.motion = createCollapseMotion(index, damage.fragments, { variant: damage.variant, family, clearanceFloor: damage.clearanceFloor });
         damage.fragments.forEach(({ root, mesh }, part) => {
