@@ -7,6 +7,9 @@ import { ArcRotateCamera } from '@babylonjs/core/Cameras/arcRotateCamera.js';
 import { Vector3, Matrix } from '@babylonjs/core/Maths/math.vector.js';
 import { Ray } from '@babylonjs/core/Culling/ray.js';
 import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { buildPhysicsTimeline } from '../src/contact-physics.js';
+import { snapshotContactFragments } from '../src/contact-preparer.js';
 import { createNineSliceBlock } from '../src/terrain.js';
 import { fractureBlock, createFractureCrack } from '../src/collapse.js';
 import { snapshotFracture, restoreFracture, fractureTransferables } from '../src/fracture-data.js';
@@ -108,77 +111,54 @@ function inspectVolumeCuts(fragments) {
   assert.ok(Math.max(...centers) - Math.min(...centers) > 0.15, 'pieces must occupy distinct vertical regions');
 }
 
-function inspectSupportOrder(tileIndex, fragments, options = {}) {
-  const motion = createCollapseMotion(tileIndex, fragments, options);
-  const repeated = createCollapseMotion(tileIndex, fragments, options);
-  assert.deepEqual(motion, repeated, 'the same variant and family must reproduce the same motion');
-  assert.ok(motion.every(item => item.family === options.family && item.variant === options.variant));
-  const releaseTimes = motion.map(item => Array.from({ length: 21 }, (_, i) => i / 100)
-    .find(t => collapsePose(item, 3, t).offset.y < -.0001));
-  assert.ok(releaseTimes.every(Number.isFinite), 'every piece must start falling near the beginning, not wait for a final solo tumble');
-  assert.ok(Math.max(...releaseTimes) - Math.min(...releaseTimes) <= .12, 'the ground and turf must release within one short shared window');
-  for (const t of [.1, .4, .7, .9]) for (let i = 0; i < motion.length; i++) {
-    assert.deepEqual(collapsePose(motion[i], 3, t), collapsePose(repeated[i], 3, t), 'the sampled trajectory must remain deterministic, including its shared rotation plan');
-  }
-  let supportedPairs = 0;
-  for (let lower = 0; lower < fragments.length; lower++) {
-    for (let upper = 0; upper < fragments.length; upper++) {
-      const a = fragments[lower], b = fragments[upper];
-      if (a.supportGroup !== b.supportGroup || a.supportLayer !== 0 || b.supportLayer !== 1) continue;
-      supportedPairs++;
-      assert.ok(releaseTimes[lower] <= releaseTimes[upper], 'the actual supporting soil must begin falling before its turf');
-      const originalGap = b.center.y - a.center.y;
-      assert.ok(originalGap > 0, 'the declared support layer must actually be below its upper chunk');
-      for (const t of [0, .1, .25, .35, .5, .65]) {
-        const low = collapsePose(motion[lower], 3, t), high = collapsePose(motion[upper], 3, t);
-        const gap = b.center.y + high.offset.y - a.center.y - low.offset.y;
-        assert.ok(gap >= originalGap - 1e-8, 'falling turf cannot close the original vertical gap by passing into its support');
-        if (high.offset.y < -1e-4) assert.ok(low.offset.y < high.offset.y - 1e-4, 'when the upper chunk starts falling, the lower chunk must already be farther down');
-      }
+let havokBinary;
+async function inspectSupportOrder(tileIndex, fragments, options = {}) {
+  havokBinary ??= await readFile(new URL(import.meta.resolve('@babylonjs/havok/lib/esm/HavokPhysics.wasm')));
+  const raw = snapshotContactFragments(fragments);
+  const timeline = await buildPhysicsTimeline(raw, { ...options, seed: tileIndex }, { wasmBinary: havokBinary });
+  assert.equal(timeline.engine, 'Havok');
+  assert.ok(timeline.dt > 0 && timeline.dt <= 1 / 60);
+  assert.equal(timeline.count, fragments.length);
+  assert.equal(timeline.values.length, (timeline.steps + 1) * timeline.count * 8);
+  assert.ok(timeline.values.every(Number.isFinite));
+  assert.ok(timeline.bodies.every(body => body.mass > 0));
+  const motion = createCollapseMotion(tileIndex, fragments, { ...options, timeline });
+  const repeated = createCollapseMotion(tileIndex, fragments, { ...options, timeline });
+  assert.deepEqual(motion, repeated, 'the same cached physical trajectory must play identically');
+  let moving = 0, turning = 0;
+  for (let i = 0; i < fragments.length; i++) {
+    const initial = collapsePose(motion[i], 3, 0);
+    assert.ok(initial.offset.length() < 1e-6 && initial.rotation.length() < 1e-6, 'the physical plan must start at its submitted stage-two pose');
+    assert.equal(initial.scale, 1, 'stage two cannot inherit the later shrink early');
+    const center = Vector3.FromArray(timeline.bodies[i].center), base = fragments[i].base;
+    let previousScale = 1;
+    for (const t of [.08, .1, .13, .16, .179999, .18]) {
+      const pose = collapsePose(motion[i], 3, t);
+      const renderedCenter = base.add(pose.offset).add(center.subtract(base).scale(pose.scale));
+      assert.ok(Vector3.Distance(renderedCenter, center) < 1e-6, 'space-making shrink must keep the actual body center fixed');
+      assert.ok(pose.scale <= previousScale + 1e-9 && pose.scale > .7);
+      previousScale = pose.scale;
     }
-  }
-  assert.ok(supportedPairs >= 4, 'the test must exercise real upper/lower columns, not an empty support graph');
-  let siblingPairs = 0;
-  for (let i = 0; i < fragments.length; i++) for (let j = i + 1; j < fragments.length; j++) {
-    const a = fragments[i], b = fragments[j];
-    if (a.supportGroup !== b.supportGroup || a.supportLayer !== b.supportLayer) continue;
-    siblingPairs++;
-    const distance = Vector3.Distance(a.base, b.base);
-    for (const t of [.7, .85, 1]) {
-      const left = collapsePose(motion[i], 3, t), right = collapsePose(motion[j], 3, t);
-      const movedDistance = Vector3.Distance(a.base.add(left.offset), b.base.add(right.offset));
-      // Babylon stores its rotation matrix in Float32 even when source vertex
-      // arrays are doubles. This tolerance is below a visible displacement.
-      assert.ok(Math.abs(movedDistance - distance) < 1e-6, 'late tumble must keep same-layer chunks at their original separation');
-      assert.ok(Vector3.Distance(left.rotation, right.rotation) < 1e-8, 'same-layer chunks must rotate as one rigid assembly');
+    assert.equal(previousScale, timeline.bodies[i].scale, 'render and Havok must share the same collision scale');
+    const beforePhysics = collapsePose(motion[i], 3, .18 - 1e-7), afterPhysics = collapsePose(motion[i], 3, .18);
+    assert.ok(Vector3.Distance(beforePhysics.offset, afterPhysics.offset) < 1e-6 && Math.abs(beforePhysics.scale - afterPhysics.scale) < 1e-6, 'shrink-to-physics handoff must be continuous');
+    for (const t of [.1, .25, .4, .6, .8, 1]) {
+      const pose = collapsePose(motion[i], 3, t);
+      assert.deepEqual(pose, collapsePose(repeated[i], 3, t));
+      assert.ok([...pose.offset.asArray(), ...pose.quaternion.asArray(), pose.fade].every(Number.isFinite));
+      assert.ok(Math.abs(pose.quaternion.length() - 1) < 1e-5);
+      assert.ok(pose.fade >= 0 && pose.fade <= 1);
     }
+    const middle = collapsePose(motion[i], 3, .6);
+    if (middle.offset.y < -.03) moving++;
+    if (middle.rotation.length() > .03) turning++;
+    assert.equal(collapsePose(motion[i], 3, 1).fade, 0);
   }
-  if (fragments.length > 8) assert.ok(siblingPairs > 0, 'extra subdivisions must exercise the sibling collision regression');
-  const columns = new Map();
-  fragments.forEach((fragment, i) => {
-    if (!columns.has(fragment.supportGroup)) columns.set(fragment.supportGroup, []);
-    columns.get(fragment.supportGroup).push(i);
-  });
-  for (const t of [.35, .5, .7]) {
-    const drops = [...columns.values()].map(ids => {
-      const upper = ids.filter(i => fragments[i].supportLayer === 1);
-      const volume = upper.reduce((sum, i) => sum + fragments[i].volume, 0);
-      return upper.reduce((sum, i) => sum + collapsePose(motion[i], 3, t).offset.y * fragments[i].volume, 0) / volume;
-    });
-    assert.ok(Math.max(...drops) - Math.min(...drops) < .4, 'upper chunks must fall at comparable rates instead of leaving a final slow solo piece');
-  }
-  // The visible family-specific bend now happens on the intact roof in stage
-  // two. A later collision-constrained fall may keep some pieces upright.
-  for (const ids of columns.values()) {
-    const radial = ids.reduce((sum, i) => sum.addInPlace(fragments[i].base.scale(fragments[i].volume)), Vector3.Zero());
-    radial.y = 0; radial.normalize();
-    for (const i of ids) for (const t of [.5, .65, .75, .82, .9]) {
-      const pose = collapsePose(motion[i], 3, t), r = pose.rotation;
-      const up = Vector3.TransformNormal(Vector3.Up(), Matrix.RotationYawPitchRoll(r.y, r.x, r.z)).normalize();
-      const lean = Vector3.Dot(up, radial), expectedSign = options.family === 'inward' ? -1 : 1;
-      assert.ok(lean * expectedSign >= -1e-6, 'the actual top orientation must lean in the selected radial direction');
-    }
-  }
+  assert.ok(moving >= fragments.length * .75, 'the real solver must move the main body, not return a zero-pose metadata fallback');
+  assert.ok(turning > 0, 'physical bodies must actually turn while collapsing');
+  // Exact pair distances and lower-first ordering are deliberately not required:
+  // independent bodies may contact and roll. Actual mesh overlap and the visible
+  // upper/lower cadence are checked against the bent production meshes in WebGL.
 }
 
 function inspectCrackedSurface(source, crack, family) {
@@ -291,16 +271,34 @@ function inspectTransport(source, result) {
   const raw = snapshotFracture(result), buffers = fractureTransferables(raw);
   const transported = structuredClone(raw, { transfer: buffers });
   assert.ok(buffers.every(buffer => buffer.byteLength === 0), 'worker transfer should move only snapshot-owned buffers');
+  if (result.secondaryFragments?.length) {
+    const addMesh = scene.addMesh, childName = result.secondaryFragments[1].mesh.name;
+    let injected = false;
+    scene.addMesh = function(mesh, ...args) {
+      const added = addMesh.call(this, mesh, ...args);
+      if (mesh.name === childName) { injected = true; throw new Error('injected child hydration failure'); }
+      return added;
+    };
+    try { assert.throws(() => restoreFracture(source, transported), /injected child hydration failure/); }
+    finally { scene.addMesh = addMesh; }
+    assert.ok(injected, 'the failure must occur after a parent and an earlier child were allocated');
+    assert.deepEqual([scene.meshes.length, scene.transformNodes.length, scene.geometries.length], before, 'a failed child hydration must roll back parents and partial children together');
+  }
   const restored = restoreFracture(source, transported);
-  for (const [i, original] of [result.crack, ...result.fragments.map(f => f.mesh)].entries()) {
-    const actual = [restored.crack, ...restored.fragments.map(f => f.mesh)][i];
+  const originals = [...result.fragments, ...(result.secondaryFragments || [])];
+  const copies = [...restored.fragments, ...(restored.secondaryFragments || [])];
+  assert.equal(copies.length, originals.length);
+  for (const [i, original] of [result.crack, ...originals.map(f => f.mesh)].entries()) {
+    const actual = [restored.crack, ...copies.map(f => f.mesh)][i];
     for (const kind of original.getVerticesDataKinds()) assert.deepEqual(actual.getVerticesData(kind), original.getVerticesData(kind), `worker transport must preserve ${kind}`);
     assert.deepEqual(actual.getIndices(), original.getIndices());
     assert.deepEqual(actual.subMeshes.map(s => [s.materialIndex, s.indexStart, s.indexCount]), original.subMeshes.map(s => [s.materialIndex, s.indexStart, s.indexCount]));
   }
-  restored.fragments.forEach((f, i) => {
+  copies.forEach((f, i) => {
     assert.ok(!f.root.isEnabled(), 'hydrated pieces must remain hidden until their stage is displayed');
-    for (const [j, constraint] of f.columnConstraints.entries()) for (const point of [[-.3, -.2, .17], [.13, .2, -.23], [0, 0, 0]]) assert.equal(constraint.field(point), result.fragments[i].columnConstraints[j].field(point), 'serialized cut definitions must rebuild the same field');
+    for (const kind of ['columnConstraints', 'solidConstraints']) for (const [j, constraint] of (f[kind] || []).entries()) for (const point of [[-.3, -.2, .17], [.13, .2, -.23], [0, 0, 0]]) assert.equal(constraint.field(point), originals[i][kind][j].field(point), 'serialized cut definitions must rebuild the same field');
+    for (const key of ['parentPart', 'secondary', 'sizeRatio']) assert.equal(f[key], originals[i][key]);
+    if (f.secondary) assert.equal(f.secondaryCut.field([.1, -.2, .3]), originals[i].secondaryCut.field([.1, -.2, .3]));
   });
   restored.dispose();
   assert.deepEqual([scene.meshes.length, scene.transformNodes.length, scene.geometries.length], before);
@@ -310,7 +308,55 @@ function inspectTransport(source, result) {
   crack.dispose();
 }
 
-test('rounded fragments have closed cut faces, bounded remeshing and preserved source attributes', () => {
+test('secondary cuts replace existing parents with closed smaller solids and survive worker transfer', async () => {
+  const engine = new NullEngine(), scene = new Scene(engine);
+  try {
+    for (const [seed, variant] of [[0, 0], [12, 1], [24, 0]]) {
+      const source = createNineSliceBlock(scene, seed); source.metadata.tileIndex = seed;
+      const sourceBefore = source.getVerticesDataKinds().map(kind => [kind, [...source.getVerticesData(kind)]]);
+      const base = fractureBlock(source, { variant });
+      const parentHash = patternHash(base); base.dispose();
+      const result = fractureBlock(source, { variant, secondary: true });
+      assert.equal(patternHash(result), parentHash, 'preparing later cuts must leave every accepted stage-two parent unchanged');
+      const groups = new Map();
+      for (const child of result.secondaryFragments) {
+        const parent = result.fragments.find(f => f.part === child.parentPart);
+        assert.ok(parent && child.secondary, 'each extra piece must come from a real existing parent');
+        assert.ok(!child.root.isEnabled(), 'children must not overlap visible parents before the replacement pulse');
+        assert.equal(child.supportGroup, parent.supportGroup);
+        assert.equal(child.supportLayer, parent.supportLayer);
+        const volume = inspectSolid(child.mesh), parentVolume = inspectSolid(parent.mesh);
+        assert.equal(Math.sign(volume), Math.sign(parentVolume));
+        assert.ok(Math.abs(Math.abs(volume / parentVolume) - child.sizeRatio) < 1e-8, 'reported size must match the actual closed solid');
+        const p = child.mesh.getVerticesData('position'), bounds = parent.bounds;
+        const tolerance = child.mesh.metadata.roundedSolid.surfaceSpacing * Math.sqrt(3) + 1e-7;
+        for (let i = 0; i < p.length; i++) assert.ok(p[i] >= bounds.min[i % 3] - tolerance && p[i] <= bounds.max[i % 3] + tolerance, 'children cannot spawn unrelated material beyond the parent sampling margin');
+        assert.ok(child.mesh.subMeshes.some(s => s.materialIndex === 2 && s.indexCount > 0), 'a secondary split needs a real textured interior');
+        if (!groups.has(parent.part)) groups.set(parent.part, []);
+        groups.get(parent.part).push({ child, volume: Math.abs(volume), parentVolume: Math.abs(parentVolume) });
+      }
+      assert.ok(groups.size >= 2 && groups.size <= 3, 'several existing clods must actually subdivide');
+      for (const pieces of groups.values()) {
+        assert.equal(pieces.length, 2);
+        const retained = pieces.reduce((sum, p) => sum + p.volume, 0) / pieces[0].parentVolume;
+        assert.ok(retained > .90 && retained <= 1.000001, 'secondary rounding may trim a narrow rim, not erase or duplicate the parent mass');
+        const sizes = pieces.map(p => p.volume).sort((a, b) => a - b);
+        assert.ok(sizes[0] / sizes[1] < .7, 'the added break must make a smaller chip and a larger supporting clod');
+      }
+      if (seed === 0) {
+        const replaced = new Set(groups.keys());
+        const falling = [...result.fragments.filter(f => !replaced.has(f.part)), ...result.secondaryFragments];
+        for (const family of ['inward', 'outward']) await inspectSupportOrder(seed, falling, { family, variant });
+      }
+      inspectTransport(source, result);
+      for (const [kind, values] of sourceBefore) assert.deepEqual(source.getVerticesData(kind), values);
+      result.dispose(); source.dispose();
+      assert.deepEqual([scene.meshes.length, scene.transformNodes.length, scene.geometries.length], [0, 0, 0]);
+    }
+  } finally { scene.dispose(); engine.dispose(); }
+});
+
+test('rounded fragments have closed cut faces, bounded remeshing and preserved source attributes', async () => {
   const engine = new NullEngine(), scene = new Scene(engine);
   try {
     for (const [seed, variant] of [[0, 0], [0, 1], [12, 0], [24, 0], [19, 19]]) {
@@ -324,7 +370,7 @@ test('rounded fragments have closed cut faces, bounded remeshing and preserved s
       assert.ok(result.fragments.length >= 8 && result.fragments.length <= 12, 'each tile must partition into 8–12 solid fragments');
       inspectVolumeCuts(result.fragments);
       for (const family of ['inward', 'outward']) inspectCrackedSurface(source, result.crack, family);
-      for (const family of ['inward', 'outward']) inspectSupportOrder(seed, result.fragments, { family, variant });
+      for (const family of ['inward', 'outward']) await inspectSupportOrder(seed, result.fragments, { family, variant });
       const naturalMotion = createCollapseMotion(seed, result.fragments, { variant });
       assert.deepEqual(naturalMotion, createCollapseMotion(seed, result.fragments, { variant, family: naturalMotion[0].family }), 'forcing the selected family must reproduce the natural seeded path');
       let fragmentVolume = 0;

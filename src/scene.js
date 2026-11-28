@@ -1,3 +1,4 @@
+import { createContactPreparer, sampleContactTimeline } from './contact-preparer.js';
 import { createFractureCrack } from './collapse.js';
 import { createFracturePreparer } from './fracture-preparer.js';
 import { enableFragmentFade } from './fragment-fade.js';
@@ -7,7 +8,7 @@ import { Engine } from '@babylonjs/core/Engines/engine.js';
 import { Scene } from '@babylonjs/core/scene.js';
 import { ArcRotateCamera } from '@babylonjs/core/Cameras/arcRotateCamera.js';
 import { Camera } from '@babylonjs/core/Cameras/camera.js';
-import { Vector3, Matrix } from '@babylonjs/core/Maths/math.vector.js';
+import { Vector3, Matrix, Quaternion } from '@babylonjs/core/Maths/math.vector.js';
 import '@babylonjs/core/Culling/ray.js';
 import { Color3, Color4 } from '@babylonjs/core/Maths/math.color.js';
 import { HemisphericLight } from '@babylonjs/core/Lights/hemisphericLight.js';
@@ -67,186 +68,33 @@ function randomSource(seed) {
   };
 }
 
-// Columns preserve their original support hierarchy throughout the collapse.
-// Soil releases vertically first; radial tangent axes control the later tumble.
-export function createCollapseMotion(tileIndex, fragments, { family, variant = 0, clearanceFloor } = {}) {
+// Preparation is lazy during stage one/two; the falling plan is cached once
+// after the final supported pose and secondary geometry have been installed.
+export function createCollapseMotion(tileIndex, fragments, { family, variant = 0, timeline } = {}) {
   const seed = (13007 + tileIndex * 8191 + Math.imul(variant, 104729)) >>> 0;
-  const random = randomSource(seed);
-  const seededFamily = random() < .5 ? 'inward' : 'outward';
-  family ??= seededFamily;
-  const groups = new Map();
-  fragments.forEach((fragment, index) => {
-    const id = fragment.supportGroup;
-    if (!groups.has(id)) groups.set(id, { id, indices: [], volume: 0, topArea: 0, center: Vector3.Zero() });
-    const group = groups.get(id);
-    group.indices.push(index); group.volume += fragment.volume; group.topArea += fragment.topArea;
-    group.center.addInPlace(fragment.center.scale(fragment.volume));
+  family ??= randomSource(seed)() < .5 ? 'inward' : 'outward';
+  return fragments.map((fragment, index) => {
+    const chip = fragment.secondary && fragment.sizeRatio < .5;
+    const motion = { family, variant, seed, supportGroup: fragment.supportGroup, supportLayer: fragment.supportLayer,
+      parentPart: fragment.parentPart, secondary: !!fragment.secondary, sizeRatio: fragment.sizeRatio,
+      contactRole: chip ? 'chip' : 'load-bearing', physics: timeline ? { engine: timeline.engine, dt: timeline.dt, snapshotMs: timeline.snapshotMs, totalPreparationMs: timeline.totalPreparationMs, simulationMs: timeline.preparationMs, body: timeline.bodies[index] } : null, settle: Vector3.Zero(), lag: 0,
+      fallLag: .10, fallDistance: chip ? 6.4 : 3.6, fallSpin: Vector3.Zero() };
+    Object.defineProperty(motion, 'sample', { value(t) {
+      if (timeline) return sampleContactTimeline(timeline, index, t);
+      return { offset: Vector3.Zero(), rotation: Vector3.Zero(), quaternion: Quaternion.Identity(), scale: 1, contact: false };
+    } });
+    return motion;
   });
-  const columns = [...groups.values()];
-  columns.forEach(group => group.center.scaleInPlace(1 / group.volume));
-  const preference = columns.map(() => random());
-  const releaseOrder = [...columns.keys()].sort((a, b) => preference[a] - preference[b]);
-  columns.forEach((group, i) => {
-    group.affected = false;
-    group.releaseRank = releaseOrder.indexOf(i);
-    group.strength = .985 + random() * .03;
-    group.layers = [0, 1].map(layer => {
-      const siblings = group.indices.map(index => fragments[index]).filter(fragment => fragment.supportLayer === layer);
-      const volume = siblings.reduce((sum, fragment) => sum + fragment.volume, 0);
-      const pivot = siblings.reduce((sum, fragment) => sum.addInPlace(fragment.base.scale(fragment.volume)), Vector3.Zero()).scaleInPlace(1 / volume);
-      const r = randomSource(siblings[0].seed ^ seed);
-      const low = new Vector3(Infinity, Infinity, Infinity), high = new Vector3(-Infinity, -Infinity, -Infinity);
-      siblings.forEach(fragment => {
-        const origin = fragment.base.add(fragment.mesh.position);
-        for (const axis of ['x', 'y', 'z']) {
-          const j = { x: 0, y: 1, z: 2 }[axis];
-          low[axis] = Math.min(low[axis], origin[axis] + fragment.bounds.min[j] * fragment.mesh.scaling[axis]);
-          high[axis] = Math.max(high[axis], origin[axis] + fragment.bounds.max[j] * fragment.mesh.scaling[axis]);
-        }
-      });
-      // Choose the tile edge facing away from the center as the hinge. A pure
-      // X/Z hinge avoids a diagonal AABB corner sweeping into the next tile.
-      const axis = Math.abs(group.center.x) >= Math.abs(group.center.z) ? 'x' : 'z';
-      const direction = Math.sign(group.center[axis]) || 1;
-      pivot[axis] = direction > 0 ? high[axis] : low[axis];
-      pivot.y = family === 'inward' ? low.y : high.y;
-      const radius = Math.hypot(...['x', 'y', 'z'].map(axis => Math.max(Math.abs(low[axis] - pivot[axis]), Math.abs(high[axis] - pivot[axis]))));
-      const radial = axis === 'x' ? new Vector3(direction, 0, 0) : new Vector3(0, 0, direction);
-      const angle = .38 + r() * .16, sign = family === 'inward' ? -1 : 1;
-      return { pivot, low, high, radius, spin: new Vector3(radial.z * angle * sign, 0, -radial.x * angle * sign) };
-    });
-  });
-  const tileBottom = Math.min(clearanceFloor ?? Infinity, ...columns.flatMap(group => group.layers.map(layer => layer.low.y)));
-  const layers = columns.flatMap(group => group.layers);
-  const footprint = {
-    minX: Math.min(...layers.map(layer => layer.low.x)), maxX: Math.max(...layers.map(layer => layer.high.x)),
-    minZ: Math.min(...layers.map(layer => layer.low.z)), maxZ: Math.max(...layers.map(layer => layer.high.z)),
-  };
-  const motions = fragments.map(fragment => {
-    const group = groups.get(fragment.supportGroup), lower = fragment.supportLayer === 0;
-    const layer = group.layers[fragment.supportLayer];
-    const settle = Vector3.Zero();
-    return { affected: group.affected, supportGroup: group.id, supportLayer: fragment.supportLayer, family, variant, seed,
-      settle, tilt: Vector3.Zero(), lag: 0,
-      fallLag: (lower ? 0 : .07) + group.releaseRank * .008,
-      fallDistance: (lower ? 6.0 : 4.8) * group.strength,
-      fallDrift: Vector3.Zero(), fallPivotOffset: fragment.base.subtract(layer.pivot),
-      layerPivotY: layer.pivot.y, layerRadius: layer.radius, tileBottom,
-      fallSpin: layer.spin.clone() };
-  });
-  const entries = layers.map(layer => {
-    const ids = fragments.flatMap((fragment, i) => groups.get(fragment.supportGroup).layers[fragment.supportLayer] === layer ? [i] : []);
-    const first = fragments[ids[0]], origin = first.base.add(first.mesh.position), scale = first.mesh.scaling.clone(), points = [];
-    const low = new Vector3(Infinity, Infinity, Infinity), high = new Vector3(-Infinity, -Infinity, -Infinity);
-    for (const id of ids) {
-      const fragment = fragments[id], p = fragment.mesh.getVerticesData('position');
-      const warped = fragment.mesh.isVerticesDataPresent('terrainAuthoredHeight');
-      for (let j = 0; j < p.length; j += 3) {
-        const x = p[j] * scale.x + origin.x, y = (p[j + 1] + (warped ? 0 : crackDepression(p[j], p[j + 1], p[j + 2]))) * scale.y + origin.y, z = p[j + 2] * scale.z + origin.z;
-        points.push(x, y, z); low.x = Math.min(low.x, x); low.y = Math.min(low.y, y); low.z = Math.min(low.z, z);
-        high.x = Math.max(high.x, x); high.y = Math.max(high.y, y); high.z = Math.max(high.z, z);
-      }
-    }
-    const constraints = (first.columnConstraints || []).map(c => {
-      let limit = 0;
-      for (let i = 0; i < points.length; i += 3) limit = Math.max(limit, c.field([(points[i] - origin.x) / scale.x, 0, (points[i + 2] - origin.z) / scale.z]) * c.side);
-      return { ...c, limit: limit + .0001 };
-    });
-    return { ...layer, ids, origin, scale, points, low, high, constraints, motion: motions[ids[0]] };
-  });
-  const plan = makeRollPlan(entries, footprint, tileBottom);
-  entries.forEach((entry, index) => entry.ids.forEach(id => {
-    Object.defineProperty(motions[id], 'rollPlan', { value: plan, writable: true });
-    motions[id].rollLayer = index;
-  }));
-  return motions;
 }
-
-function makeRollPlan(entries, footprint, tileBottom) {
-  let cachedTime = -1, cachedAngles;
-  const smooth = value => { const x = clamp(value); return x * x * (3 - 2 * x); };
-  const boundsY = (entry, fraction, drop) => {
-    const angle = (entry.spin.x || entry.spin.z) * fraction, c = Math.cos(angle), s = Math.sin(angle);
-    let min = Infinity, max = -Infinity;
-    for (const x of [entry.low.x, entry.high.x]) for (const y of [entry.low.y, entry.high.y]) for (const z of [entry.low.z, entry.high.z]) {
-      const q = (entry.spin.x ? -(z - entry.pivot.z) : x - entry.pivot.x) * s + (y - entry.pivot.y) * c + entry.pivot.y + drop;
-      min = Math.min(min, q); max = Math.max(max, q);
-    }
-    return [min, max];
-  };
-  return { sample(t) {
-    if (cachedTime === t) return cachedAngles;
-    cachedTime = t;
-    const desired = smooth((t - .18) / .46);
-    const drops = entries.map(({ motion }) => {
-      const fall = clamp((t - motion.fallLag) / (1 - motion.fallLag));
-      return motion.settle.y - .18 * fall - motion.fallDistance * fall * fall;
-    });
-    // Conservative swept Y envelopes cover every angle up to the requested
-    // angle. A neighboring column releases its shared boundary only when the
-    // complete rotated layers are vertically separated.
-    const sweeps = entries.map((entry, i) => {
-      const ranges = [0, .25, .5, .75, 1].map(k => boundsY(entry, desired * k, drops[i]));
-      return [Math.min(...ranges.map(r => r[0])) - .02, Math.max(...ranges.map(r => r[1])) + .02];
-    });
-    const overlap = (a, b) => a[0] < b[1] + .008 && b[0] < a[1] + .008;
-    cachedAngles = entries.map((entry, index) => {
-      const valid = fraction => {
-        if (fraction < 1e-8) return true;
-        const range = boundsY(entry, fraction, drops[index]);
-        for (let j = 0; j < entries.length; j++) {
-          if (j !== index && entries[j].motion.supportGroup === entry.motion.supportGroup && overlap(range, sweeps[j])) return false;
-        }
-        const active = entry.constraints.filter(c => entries.some((other, j) => j !== index &&
-          other.constraints.some(d => d.cutId === c.cutId && d.side !== c.side) && overlap(range, sweeps[j])));
-        const protectTile = range[1] >= tileBottom - .01;
-        if (!protectTile && !active.length) return true;
-        const angle = (entry.spin.x || entry.spin.z) * fraction, cosine = Math.cos(angle), sine = Math.sin(angle);
-        const p = entry.points, pivot = entry.pivot;
-        for (let k = 0; k < p.length; k += 3) {
-          const dx = p[k] - pivot.x, dy = p[k + 1] - pivot.y, dz = p[k + 2] - pivot.z;
-          const x = entry.spin.x ? p[k] : dx * cosine - dy * sine + pivot.x;
-          const z = entry.spin.x ? dy * sine + dz * cosine + pivot.z : p[k + 2];
-          if (protectTile && (x < footprint.minX - 1e-6 || x > footprint.maxX + 1e-6 || z < footprint.minZ - 1e-6 || z > footprint.maxZ + 1e-6)) return false;
-          const local = [(x - entry.origin.x) / entry.scale.x, 0, (z - entry.origin.z) / entry.scale.z];
-          for (const constraint of active) if (constraint.field(local) * constraint.side > constraint.limit) return false;
-        }
-        return true;
-      };
-      let low = 0, high = desired;
-      // Prefix search never jumps across an unsafe interval into a later pose.
-      for (let step = 1; step <= 6; step++) {
-        const candidate = desired * step / 6;
-        if (!valid(candidate)) { high = candidate; break; }
-        low = candidate;
-      }
-      for (let step = 0; step < 8 && high - low > .0005; step++) {
-        const mid = (low + high) / 2; if (valid(mid)) low = mid; else high = mid;
-      }
-      return low;
-    });
-    return cachedAngles;
-  } };
-}
-
-// Both the renderer and diagnostics use this trajectory. Rotation waits until
-// the lower layer has opened a visible gap; no arbitrary spin occurs at rest.
 export function collapsePose(motion, stage, t) {
-  const smooth = value => { const x = clamp(value); return x * x * (3 - 2 * x); };
-  if (stage === 2) {
-    const drop = smooth((t - motion.lag) / (1 - motion.lag));
-    return { offset: new Vector3(0, motion.settle.y * drop, 0), rotation: Vector3.Zero(), fade: 1 };
+  if (stage === 2) return { offset: Vector3.Zero(), rotation: Vector3.Zero(), fade: 1, contact: false };
+  const f=clamp((t-.82)/.18);
+  if(t<.18){
+    const start=motion.sample(0),p=clamp((t-.08)/.10),u=p*p*(3-2*p);
+    return {offset:start.offset.scale(u),rotation:Vector3.Zero(),quaternion:Quaternion.Identity(),scale:1+(start.scale-1)*u,fade:1,contact:false};
   }
-  const fall = clamp((t - motion.fallLag) / (1 - motion.fallLag));
-  const offset = Vector3.Zero();
-  offset.y = -(.18 * fall + motion.fallDistance * fall * fall);
-  const spin = motion.rollPlan.sample(t)[motion.rollLayer];
-  const rotation = motion.fallSpin.scale(spin);
-  // Adjacent siblings rotate as one rigid layer, rather than turning into each
-  // other around separate centers. Their existing gap is preserved exactly.
-  const transform = Matrix.RotationYawPitchRoll(rotation.y, rotation.x, rotation.z);
-  offset.addInPlace(Vector3.TransformCoordinates(motion.fallPivotOffset, transform).subtract(motion.fallPivotOffset));
-  return { offset, rotation, fade: 1 - smooth((t - .82) / .18) };
+  const pose=motion.sample(clamp((t-.18)/.82));
+  return {...pose,fade:1-f*f*(3-2*f)};
 }
 
 // Stage one depresses a disposable shell. Its resting shape is transferred to
@@ -315,7 +163,7 @@ export function createCrackedSurface(source, crack, { family = 'inward' } = {}) 
     mesh.updateVerticesData('color', blend(from.colors, to.colors, progress));
     crack.updateVerticesData('position', blend(lineFrom, lineTo, progress), true);
   };
-  return { mesh, depth: .14, family, offsetAt, shadeAt,
+  return { mesh, depth: .14, family, offsetAt, shadeAt, shape: { coreX, coreZ },
     update(progress) { apply({ positions: original, normals, colors: originalColors }, cracked, crackBase, crackedLine, progress); },
   };
 }
@@ -395,7 +243,7 @@ export function createSplitRoof(fragments, family) {
       }
       const manager = new MorphTargetManager(f.mesh.getScene()), morph = new MorphTarget(`${f.mesh.name}-supported-bend`, 0, f.mesh.getScene());
       manager.optimizeInfluencers = false; morph.setPositions(target); morph.setNormals(targetNormals); manager.addTarget(morph); f.mesh.morphTargetManager = manager;
-      f.mesh.metadata.roofSplit = { family, axis, angle, shrink, lift, anchor, connectedBody: true };
+      f.mesh.metadata.roofSplit = { family, axis, angle, shrink, lift, anchor, connectedBody: true, pivot: pivot.asArray(), origin: origin.asArray(), scale: scale.asArray() };
       changes.push({ mesh: f.mesh, target, targetNormals, manager, morph, baked: false });
     }
   }
@@ -411,6 +259,28 @@ export function createSplitRoof(fragments, family) {
       } else change.morph.influence = progress;
     }
   }, dispose() { changes.forEach(release); } };
+}
+
+function connectedPoint(meta, point) {
+  const t = clamp(((point[1] - meta.origin[1]) / meta.scale[1] - meta.anchor) / (.245 - meta.anchor)), weight = t*t*(3-2*t);
+  const contraction = 1 + (meta.shrink - 1) * weight, [px,py,pz] = meta.pivot;
+  const dx = (point[0]-px)*contraction,dy=point[1]-py,dz=(point[2]-pz)*contraction,c=Math.cos(meta.angle*weight),sn=Math.sin(meta.angle*weight);
+  return meta.axis === 'z' ? [dx*c-dy*sn+px, dx*sn+dy*c+py+meta.lift*weight,dz+pz]
+    : [dx+px,dy*c-dz*sn+py+meta.lift*weight,dy*sn+dz*c+pz];
+}
+function inheritRoofPose(children, parents, surface) {
+  bendFragments(children, surface);
+  for (const child of children) {
+    const meta = parents.find(f => f.part === child.parentPart).mesh.metadata.roofSplit;
+    const mesh=child.mesh,p=[...mesh.getVerticesData('position')],n=[...mesh.getVerticesData('normal')],scale=meta.scale,origin=meta.origin;
+    for(let i=0;i<p.length;i+=3){
+      const point=[p[i]*scale[0]+origin[0],p[i+1]*scale[1]+origin[1],p[i+2]*scale[2]+origin[2]],q=connectedPoint(meta,point),h=.0001;
+      const derivatives=[0,1,2].map(axis=>{const a=[...point],b=[...point];a[axis]+=h;b[axis]-=h;const qa=connectedPoint(meta,a),qb=connectedPoint(meta,b);return new Vector3(...qa.map((v,j)=>(v-qb[j])/(2*h)));});
+      const normal=Vector3.Cross(derivatives[1],derivatives[2]).scale(n[i]/scale[0]).addInPlace(Vector3.Cross(derivatives[2],derivatives[0]).scale(n[i+1]/scale[1])).addInPlace(Vector3.Cross(derivatives[0],derivatives[1]).scale(n[i+2]/scale[2])).multiply(Vector3.FromArray(scale)).normalize();
+      p.splice(i,3,...q.map((v,j)=>(v-origin[j])/scale[j]));n.splice(i,3,normal.x,normal.y,normal.z);
+    }
+    mesh.setVerticesData('position',p);mesh.setVerticesData('normal',n);mesh.metadata.roofSplit=meta;
+  }
 }
 
 function noise(x, y) {
@@ -712,6 +582,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   let boardPreviewSize = null, previewTerrain = null, rotation = 0, dropMode = false, viewBusy = false;
   let fractureVariant = 0;
   const fracturePreparer = createFracturePreparer();
+  const contactPreparer = createContactPreparer();
   const flatCoord = (index, size = SIZE) => new Vector3((index % size - (size - 1) / 2) * STEP, 0, ((size - 1) / 2 - Math.floor(index / size)) * STEP);
   const screenUp = new Vector3(0, Math.sin(camera.beta), Math.cos(camera.beta));
   const screenRight = new Vector3(1, 0, 0);
@@ -1093,7 +964,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     const terrain = activeTerrain();
     if (terrain.damage.some(damage => damage && !damage.fragments.length)) return;
     if (terrain.stages[index] !== 0) return;
-    fracturePreparer.prepare(terrain.groundTiles[index], { variant: fractureVariant }).catch(error => {
+    fracturePreparer.prepare(terrain.groundTiles[index], { variant: fractureVariant, secondary: true }).catch(error => {
       if (error.name !== 'AbortError') console.error('Fracture preparation failed:', error);
     });
   }
@@ -1118,7 +989,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     damage.crack.material = crackMaterial; glow.addExcludedMesh(damage.crack);
     // Only the inexpensive partition and crack run on the UI thread. The solid
     // fragments are prepared during the visible first-stage crack animation.
-    fracturePreparer.prepare(tile, { variant }).catch(error => {
+    fracturePreparer.prepare(tile, { variant, secondary: true }).catch(error => {
       if (error.name !== 'AbortError') console.error('Fracture preparation failed:', error);
     });
     const dispose = damage.dispose;
@@ -1128,7 +999,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       damageDisposed = true;
       damage.releaseCrackedShell?.();
       damage.splitRoof?.dispose();
-      const meshes = new Set(damage.fragments.map(({ mesh }) => mesh));
+      const meshes = new Set((damage.allFragments || damage.fragments).map(({ mesh }) => mesh));
       soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter((mesh) => !meshes.has(mesh));
       meshes.forEach((mesh) => { shadows.removeShadowCaster(mesh, false); glow.removeExcludedMesh(mesh); });
       glow.removeExcludedMesh(damage.crack); damage.releaseFragments?.(); dispose();
@@ -1137,14 +1008,29 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   };
   const ensureFragments = async (terrain, index, damage) => {
     if (damage.fragments.length) return;
-    const result = await fracturePreparer.fracture(terrain.groundTiles[index], { variant: damage.variant });
+    const result = await fracturePreparer.fracture(terrain.groundTiles[index], { variant: damage.variant, secondary: true });
     if (disposed || terrain.damage[index] !== damage) { result.dispose(); return; }
     result.crack.dispose(false, false);
-    damage.fragments = result.fragments; damage.releaseFragments = result.dispose;
+    damage.fragments = result.fragments; damage.secondaryFragments = result.secondaryFragments || []; damage.allFragments = [...damage.fragments, ...damage.secondaryFragments]; damage.releaseFragments = result.dispose;
     installFragments(terrain, index, damage);
   };
+  const prepareFinalCollapse = (terrain, index, damage) => {
+    if (damage.contactTimeline) return Promise.resolve(damage.contactTimeline);
+    if (damage.contactPreparing) return damage.contactPreparing;
+    if (!damage.fallingFragments) {
+      inheritRoofPose(damage.secondaryFragments, damage.fragments, damage.surface);
+      const replaced = new Set(damage.secondaryFragments.map(f => f.parentPart));
+      damage.fallingFragments = [...damage.fragments.filter(f => !replaced.has(f.part)), ...damage.secondaryFragments];
+    }
+    const seed = (13007 + index * 8191 + Math.imul(damage.variant, 104729)) >>> 0;
+    damage.contactPreparing = contactPreparer.prepare(damage.fallingFragments,
+      { family: damage.surface.family, variant: damage.variant, seed, clearanceFloor: damage.clearanceFloor })
+      .then(timeline => { if (!disposed && terrain.damage[index] === damage) damage.contactTimeline = timeline; return timeline; })
+      .finally(() => { damage.contactPreparing = null; });
+    return damage.contactPreparing;
+  };
   const resetTerrainDamage = (terrain) => {
-    fracturePreparer.cancel();
+    fracturePreparer.cancel(); contactPreparer.cancel();
     terrain.damage.forEach((damage, i) => {
       damage?.dispose(); terrain.damage[i] = null; terrain.stages[i] = 0;
       terrain.groundTiles[i].setEnabled(true); terrain.tileRoots[i].position.copyFrom(flatCoord(i, terrain.size));
@@ -1163,6 +1049,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       if (disposed) return false;
       const damage = getDamage(terrain, index), tile = terrain.groundTiles[index];
       if (next === 2) { await ensureFragments(terrain, index, damage); if (disposed) return false; }
+      if (next === 3) { await prepareFinalCollapse(terrain, index, damage); if (disposed) return false; }
       terrain.stages[index] = next;
       if (next === 1) {
         const surface = createCrackedSurface(tile, damage.crack, { family: damage.family });
@@ -1190,23 +1077,31 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
         damage.fragments.forEach(({ root }) => root.setEnabled(true));
         damage.releaseCrackedShell?.(); damage.crack.setEnabled(false);
         await animate(700, (t) => { damage.splitRoof.update(ease(t)); });
+        void prepareFinalCollapse(terrain, index, damage).catch(error => { if (error.name !== 'AbortError') damage.contactError = error; });
       } else {
         damage.splitRoof?.dispose();
-        const family = damage.surface.family;
-        damage.motion = createCollapseMotion(index, damage.fragments, { variant: damage.variant, family, clearanceFloor: damage.clearanceFloor });
-        damage.fragments.forEach(({ root, mesh }, part) => {
-          mesh.metadata.collapseMotion = damage.motion[part]; root.setEnabled(true);
+        const family = damage.surface.family, parents = damage.fragments;
+        const replaced = new Set(damage.secondaryFragments.map(f => f.parentPart));
+        damage.fragments = damage.fallingFragments;
+        damage.motion = createCollapseMotion(index, damage.fragments, { variant: damage.variant, family, clearanceFloor: damage.clearanceFloor,
+          timeline: damage.contactTimeline });
+        damage.secondaryFragments.forEach(({mesh})=>{
+          mesh.material=fractureMaterials.get(tile.material);shadows.addShadowCaster(mesh);glow.addExcludedMesh(mesh);soilFill.includedOnlyMeshes.push(mesh);
         });
+        damage.fragments.forEach(({ mesh }, part) => { mesh.metadata.collapseMotion = damage.motion[part]; });
         damage.releaseCrackedShell?.(); damage.crackedDepression = 0;
         damage.crack.setEnabled(false); sync(latestState); setFocus(null);
+        let handedOff = false;
         const starts = damage.fragments.map(({ root }) => ({ position: root.position.clone(), rotation: root.rotation.clone() }));
-        await animate(1150, (t) => {
+        await animate(1800, (t) => {
+          if (!handedOff && t >= .08) { parents.filter(f => replaced.has(f.part)).forEach(f => f.root.setEnabled(false)); damage.secondaryFragments.forEach(f => f.root.setEnabled(true)); handedOff = true; }
           damage.fragments.forEach(({ root, mesh }, i) => {
             const start = starts[i], motion = damage.motion[i];
             const pose = collapsePose(motion, 3, t);
             root.position.copyFrom(start.position).addInPlace(pose.offset);
-            root.rotation.copyFrom(start.rotation).addInPlace(pose.rotation);
-            mesh.visibility = pose.fade;
+            root.rotationQuaternion = pose.quaternion.clone();
+            root.scaling.setAll(pose.scale);
+            mesh.visibility = pose.fade; mesh.metadata.collapseContact = pose.contact;
           });
         });
         damage.dispose(); terrain.damage[index] = null;
@@ -1422,7 +1317,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     sync, showTargeting, setFocus, playEvents, resize, setBoardPreview,
     rotateBoard, setTileDropMode, toggleTileDrop, resetBoardView, getBoardViewState, moveFocusTile, isTileAvailable,
     dispose() {
-      disposed = true; fracturePreparer.dispose(); observer.disconnect(); engine.stopRenderLoop(render);
+      disposed = true; fracturePreparer.dispose(); contactPreparer.dispose(); observer.disconnect(); engine.stopRenderLoop(render);
       previewTerrain?.dispose(); previewTerrain = null;
       labelsRoot.style.visibility = savedLabelVisibility;
       animations.forEach((job) => job.resolve()); animations.clear();
