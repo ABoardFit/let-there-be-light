@@ -109,12 +109,15 @@ function inspectVolumeCuts(fragments) {
 
 function inspectSupportOrder(tileIndex, fragments, options = {}) {
   const motion = createCollapseMotion(tileIndex, fragments, options);
-  assert.deepEqual(motion, createCollapseMotion(tileIndex, fragments, options), 'the same variant and family must reproduce the same motion');
+  const repeated = createCollapseMotion(tileIndex, fragments, options);
+  assert.deepEqual(motion, repeated, 'the same variant and family must reproduce the same motion');
   assert.ok(motion.every(item => item.family === options.family && item.variant === options.variant));
-  for (const item of motion) for (const t of [0, .2, .4, .6, .8, 1]) {
-    const pose = collapsePose(item, 2, t);
-    assert.ok(Math.hypot(pose.offset.x, pose.offset.z) < 1e-9, 'partial collapse must not spread into adjacent tiles');
-    assert.ok(pose.rotation.length() < 1e-9, 'partial collapse must descend without tipping into adjacent tiles');
+  const releaseTimes = motion.map(item => Array.from({ length: 21 }, (_, i) => i / 100)
+    .find(t => collapsePose(item, 3, t).offset.y < -.0001));
+  assert.ok(releaseTimes.every(Number.isFinite), 'every piece must start falling near the beginning, not wait for a final solo tumble');
+  assert.ok(Math.max(...releaseTimes) - Math.min(...releaseTimes) <= .12, 'the ground and turf must release within one short shared window');
+  for (const t of [.1, .4, .7, .9]) for (let i = 0; i < motion.length; i++) {
+    assert.deepEqual(collapsePose(motion[i], 3, t), collapsePose(repeated[i], 3, t), 'the sampled trajectory must remain deterministic, including its shared rotation plan');
   }
   let supportedPairs = 0;
   for (let lower = 0; lower < fragments.length; lower++) {
@@ -122,12 +125,11 @@ function inspectSupportOrder(tileIndex, fragments, options = {}) {
       const a = fragments[lower], b = fragments[upper];
       if (a.supportGroup !== b.supportGroup || a.supportLayer !== 0 || b.supportLayer !== 1) continue;
       supportedPairs++;
-      assert.equal(motion[lower].affected, motion[upper].affected, 'the turf and its supporting soil must fail as one column');
-      assert.ok(motion[lower].lag <= motion[upper].lag && motion[lower].fallLag <= motion[upper].fallLag, 'supporting soil must begin releasing before its turf');
+      assert.ok(releaseTimes[lower] <= releaseTimes[upper], 'the actual supporting soil must begin falling before its turf');
       const originalGap = b.center.y - a.center.y;
       assert.ok(originalGap > 0, 'the declared support layer must actually be below its upper chunk');
-      for (const stage of [2, 3]) for (const t of [0, .1, .25, .35, .5, .65]) {
-        const low = collapsePose(motion[lower], stage, t), high = collapsePose(motion[upper], stage, t);
+      for (const t of [0, .1, .25, .35, .5, .65]) {
+        const low = collapsePose(motion[lower], 3, t), high = collapsePose(motion[upper], 3, t);
         const gap = b.center.y + high.offset.y - a.center.y - low.offset.y;
         assert.ok(gap >= originalGap - 1e-8, 'falling turf cannot close the original vertical gap by passing into its support');
         if (high.offset.y < -1e-4) assert.ok(low.offset.y < high.offset.y - 1e-4, 'when the upper chunk starts falling, the lower chunk must already be farther down');
@@ -156,7 +158,16 @@ function inspectSupportOrder(tileIndex, fragments, options = {}) {
     if (!columns.has(fragment.supportGroup)) columns.set(fragment.supportGroup, []);
     columns.get(fragment.supportGroup).push(i);
   });
-  let visibleTilts = 0;
+  for (const t of [.35, .5, .7]) {
+    const drops = [...columns.values()].map(ids => {
+      const upper = ids.filter(i => fragments[i].supportLayer === 1);
+      const volume = upper.reduce((sum, i) => sum + fragments[i].volume, 0);
+      return upper.reduce((sum, i) => sum + collapsePose(motion[i], 3, t).offset.y * fragments[i].volume, 0) / volume;
+    });
+    assert.ok(Math.max(...drops) - Math.min(...drops) < .4, 'upper chunks must fall at comparable rates instead of leaving a final slow solo piece');
+  }
+  // The visible family-specific bend now happens on the intact roof in stage
+  // two. A later collision-constrained fall may keep some pieces upright.
   for (const ids of columns.values()) {
     const radial = ids.reduce((sum, i) => sum.addInPlace(fragments[i].base.scale(fragments[i].volume)), Vector3.Zero());
     radial.y = 0; radial.normalize();
@@ -165,16 +176,14 @@ function inspectSupportOrder(tileIndex, fragments, options = {}) {
       const up = Vector3.TransformNormal(Vector3.Up(), Matrix.RotationYawPitchRoll(r.y, r.x, r.z)).normalize();
       const lean = Vector3.Dot(up, radial), expectedSign = options.family === 'inward' ? -1 : 1;
       assert.ok(lean * expectedSign >= -1e-6, 'the actual top orientation must lean in the selected radial direction');
-      if (Math.abs(lean) > .10 && pose.fade > .5) visibleTilts++;
     }
   }
-  assert.ok(visibleTilts > 0, 'the family must visibly tip the upper surface rather than only translate its center');
 }
 
-function inspectCrackedSurface(source, crack) {
+function inspectCrackedSurface(source, crack, family) {
   const sourcePositions = [...source.getVerticesData('position')], crackPositions = [...crack.getVerticesData('position')];
   const sourceColors = [...source.getVerticesData('color')];
-  const surface = createCrackedSurface(source, crack);
+  const surface = createCrackedSurface(source, crack, { family });
   assert.notEqual(surface.mesh.geometry, source.geometry, 'subsidence needs a separate restorable geometry');
   assert.ok(!source.isVerticesDataPresent('terrainAuthoredHeight'), 'damage cannot add shader inputs to the intact source');
   assert.deepEqual(surface.mesh.getVerticesData('terrainAuthoredHeight'), sourcePositions.filter((_, i) => i % 3 === 1), 'texture blending must keep the original material height while geometry sinks');
@@ -196,6 +205,32 @@ function inspectCrackedSurface(source, crack) {
     assert.ok(hit.hit, 'the crack must stay over the deformed turf');
     assert.ok(Math.abs(marks[i + 1] - hit.pickedPoint.y - .004) < 1e-5, 'the crack must follow the actual triangles instead of floating above the depression');
   }
+  const crackedPositions = [...depressed];
+  surface.fold(.5);
+  const halfway = surface.mesh.getVerticesData('position')[center * 3 + 1];
+  surface.fold(1); surface.mesh.computeWorldMatrix(true);
+  const folded = surface.mesh.getVerticesData('position'), direction = family === 'inward' ? -1 : 1;
+  const roofChange = folded[center * 3 + 1] - crackedPositions[center * 3 + 1];
+  assert.ok(roofChange * direction > .05, 'the second stage must bend the actual roof in its selected direction');
+  assert.ok((halfway - crackedPositions[center * 3 + 1]) * direction > 0 && Math.abs(halfway - crackedPositions[center * 3 + 1]) < Math.abs(roofChange));
+  const footprint = [0, 2].map(axis => sourcePositions.filter((_, i) => i % 3 === axis));
+  const limits = footprint.map(values => [Math.min(...values), Math.max(...values)]);
+  for (let i = 0; i < folded.length; i += 3) {
+    for (const [j, axis] of [0, 2].entries()) assert.ok(folded[i + axis] >= limits[j][0] - 1e-9 && folded[i + axis] <= limits[j][1] + 1e-9, 'the bent roof must stay inside its original tile footprint');
+    if (sourcePositions[i + 1] <= 0) assert.ok(folded.slice(i, i + 3).every((v, j) => v === crackedPositions[i + j]), 'stage two must leave the existing lower ground stationary and intact');
+    if (sourcePositions[i + 1] <= -.20) assert.ok(folded.slice(i, i + 3).every((v, j) => v === sourcePositions[i + j]), 'deep soil and the underside must preserve the original geometry');
+  }
+  inspectSolid(surface.mesh);
+  let lean = 0, area = 0;
+  const indices = surface.mesh.getIndices(), top = source.subMeshes[0];
+  for (let i = top.indexStart; i < top.indexStart + top.indexCount; i += 3) {
+    const [a, b, c] = indices.slice(i, i + 3).map(id => Vector3.FromArray(folded, id * 3));
+    const middle = a.add(b).add(c).scale(1 / 3), radius = Math.hypot(middle.x, middle.z);
+    if (radius < .08 || radius > .32) continue;
+    const normal = Vector3.Cross(b.subtract(a), c.subtract(a)); if (normal.y < 0) normal.scaleInPlace(-1);
+    lean += (normal.x * middle.x + normal.z * middle.z) / radius; area += normal.length();
+  }
+  assert.ok(area > .01 && lean / area * direction > .05, 'actual roof faces must lean inward or outward, not merely change a state flag');
   assert.deepEqual(source.getVerticesData('position'), sourcePositions, 'subsidence cannot deform the intact source');
   surface.update(0);
   assert.ok(surface.mesh.getVerticesData('position').every((value, i) => value === sourcePositions[i]));
@@ -217,7 +252,7 @@ test('rounded fragments have closed cut faces, bounded remeshing and preserved s
       assert.equal(result.variant, variant);
       assert.ok(result.fragments.length >= 8 && result.fragments.length <= 12, 'each tile must partition into 8–12 solid fragments');
       inspectVolumeCuts(result.fragments);
-      inspectCrackedSurface(source, result.crack);
+      for (const family of ['inward', 'outward']) inspectCrackedSurface(source, result.crack, family);
       for (const family of ['inward', 'outward']) inspectSupportOrder(seed, result.fragments, { family, variant });
       const naturalMotion = createCollapseMotion(seed, result.fragments, { variant });
       assert.deepEqual(naturalMotion, createCollapseMotion(seed, result.fragments, { variant, family: naturalMotion[0].family }), 'forcing the selected family must reproduce the natural seeded path');

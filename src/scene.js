@@ -81,28 +81,12 @@ export function createCollapseMotion(tileIndex, fragments, { family, variant = 0
   });
   const columns = [...groups.values()];
   columns.forEach(group => group.center.scaleInPlace(1 / group.volume));
-  const totalVolume = columns.reduce((sum, group) => sum + group.volume, 0);
-  const totalTopArea = columns.reduce((sum, group) => sum + group.topArea, 0);
   const preference = columns.map(() => random());
-  let bestMask = 0, bestScore = Infinity;
-  for (let mask = 1; mask < 2 ** columns.length - 1; mask++) {
-    let volume = 0, topArea = 0, bias = 0;
-    columns.forEach((group, i) => {
-      if (mask & (1 << i)) { volume += group.volume; topArea += group.topArea; bias += preference[i]; }
-    });
-    const ratio = volume / totalVolume, topRatio = topArea / totalTopArea;
-    const score = Math.abs(ratio - .46) * 3 + Math.abs(topRatio - .45) + bias * .025
-      + (ratio < .35 || ratio > .55 ? 10 : 0);
-    if (score < bestScore) { bestScore = score; bestMask = mask; }
-  }
   const releaseOrder = [...columns.keys()].sort((a, b) => preference[a] - preference[b]);
   columns.forEach((group, i) => {
-    group.affected = !!(bestMask & (1 << i));
+    group.affected = false;
     group.releaseRank = releaseOrder.indexOf(i);
-    group.drop = .10 + random() * .06;
-
-    group.lag = random() * .08;
-    group.strength = .94 + random() * .12;
+    group.strength = .985 + random() * .03;
     group.layers = [0, 1].map(layer => {
       const siblings = group.indices.map(index => fragments[index]).filter(fragment => fragment.supportLayer === layer);
       const volume = siblings.reduce((sum, fragment) => sum + fragment.volume, 0);
@@ -125,7 +109,7 @@ export function createCollapseMotion(tileIndex, fragments, { family, variant = 0
       pivot.y = family === 'inward' ? low.y : high.y;
       const radius = Math.hypot(...['x', 'y', 'z'].map(axis => Math.max(Math.abs(low[axis] - pivot[axis]), Math.abs(high[axis] - pivot[axis]))));
       const radial = axis === 'x' ? new Vector3(direction, 0, 0) : new Vector3(0, 0, direction);
-      const angle = .95 + r() * .25, sign = family === 'inward' ? -1 : 1;
+      const angle = .38 + r() * .16, sign = family === 'inward' ? -1 : 1;
       return { pivot, low, high, radius, spin: new Vector3(radial.z * angle * sign, 0, -radial.x * angle * sign) };
     });
   });
@@ -138,11 +122,11 @@ export function createCollapseMotion(tileIndex, fragments, { family, variant = 0
   const motions = fragments.map(fragment => {
     const group = groups.get(fragment.supportGroup), lower = fragment.supportLayer === 0;
     const layer = group.layers[fragment.supportLayer];
-    const settle = new Vector3(0, group.affected ? -(group.drop + (lower ? .18 : 0)) : 0, 0);
+    const settle = Vector3.Zero();
     return { affected: group.affected, supportGroup: group.id, supportLayer: fragment.supportLayer, family, variant, seed,
-      settle, tilt: Vector3.Zero(), lag: (lower ? .30 : .46) + group.lag,
-      fallLag: lower ? group.releaseRank * .025 : [.02, .08, .14, .62][group.releaseRank],
-      fallDistance: (lower ? 7.8 - group.releaseRank * .5 : [6.0, 5.4, 4.8, 3.1][group.releaseRank]) * group.strength,
+      settle, tilt: Vector3.Zero(), lag: 0,
+      fallLag: (lower ? 0 : .07) + group.releaseRank * .008,
+      fallDistance: (lower ? 6.0 : 4.8) * group.strength,
       fallDrift: Vector3.Zero(), fallPivotOffset: fragment.base.subtract(layer.pivot),
       layerPivotY: layer.pivot.y, layerRadius: layer.radius, tileBottom,
       fallSpin: layer.spin.clone() };
@@ -262,55 +246,95 @@ export function collapsePose(motion, stage, t) {
   return { offset, rotation, fade: 1 - smooth((t - .82) / .18) };
 }
 
-// Stage one owns a disposable copy; the restorable source and its cached
-// fracture sampler never receive a vertex edit.
+// The cracked shell stays closed until the final release. Only its roof bends;
+// the original tile and cached fracture sampler are never edited.
 const crackDepression = (x, y, z) => {
   const radius = Math.max(Math.abs(x), Math.abs(z)) / .445;
   return -.14 * Math.max(0, 1 - radius * radius) ** 2 * clamp((y + .20) / .35);
 };
-export function createCrackedSurface(source, crack) {
+export function createCrackedSurface(source, crack, { family = 'inward' } = {}) {
   const mesh = source.clone(`${source.name}-cracked-surface`, source.parent, true);
-  mesh.makeGeometryUnique(); mesh.metadata = { ...source.metadata, crackedTerrain: true };
+  mesh.makeGeometryUnique(); mesh.metadata = { ...source.metadata, crackedTerrain: true, surfaceFamily: family };
   const original = [...source.getVerticesData('position')], normals = [...source.getVerticesData('normal')];
-  const originalColors = [...source.getVerticesData('color')], depressedColors = [...originalColors];
-  const target = [...original], targetNormals = [...normals], indices = source.getIndices();
-  for (let i = 0; i < original.length; i += 3) {
-    const dip = crackDepression(...original.slice(i, i + 3));
-    target[i + 1] += dip;
-    const shade = 1 + dip / .14 * .28;
-    for (let j = 0; j < 3; j++) depressedColors[i / 3 * 4 + j] *= shade;
-  }
-  const beforeNormals = [], afterNormals = [];
-  VertexData.ComputeNormals(original, indices, beforeNormals); VertexData.ComputeNormals(target, indices, afterNormals);
-  for (let i = 0; i < normals.length; i += 3) {
-    const normal = new Vector3(...normals.slice(i, i + 3).map((v, j) => v + afterNormals[i + j] - beforeNormals[i + j])).normalize();
-    targetNormals.splice(i, 3, normal.x, normal.y, normal.z);
-  }
-  const crackBase = [...crack.getVerticesData('position')], crackTarget = [...crackBase];
-  // Match the actual triangulated turf, including large central triangles,
-  // instead of letting a curved mathematical crack float above a flat face.
-  for (let i = 0; i < crackBase.length; i += 3) {
-    const x = crackBase[i], z = crackBase[i + 2]; let height = -Infinity;
-    for (let j = 0; j < source.subMeshes[0].indexCount; j += 3) {
-      const a = indices[j] * 3, b = indices[j + 1] * 3, c = indices[j + 2] * 3;
-      const den = (target[b + 2] - target[c + 2]) * (target[a] - target[c]) + (target[c] - target[b]) * (target[a + 2] - target[c + 2]);
-      if (Math.abs(den) < 1e-12) continue;
-      const u = ((target[b + 2] - target[c + 2]) * (x - target[c]) + (target[c] - target[b]) * (z - target[c + 2])) / den;
-      const v = ((target[c + 2] - target[a + 2]) * (x - target[c]) + (target[a] - target[c]) * (z - target[c + 2])) / den;
-      if (u >= -1e-7 && v >= -1e-7 && u + v <= 1 + 1e-7) height = Math.max(height, target[a + 1] * u + target[b + 1] * v + target[c + 1] * (1 - u - v));
+  const originalColors = [...source.getVerticesData('color')], indices = source.getIndices();
+  const { width, depth, capWidth, capDepth } = source.metadata.nineSlice;
+  const coreX = width / 2 - capWidth, coreZ = depth / 2 - capDepth;
+  const kernel = (x, z) => {
+    const u = Math.max(Math.abs(x) / coreX, Math.abs(z) / coreZ);
+    const radial = Math.max(Math.abs(x), Math.abs(z)) / .445;
+    // Match the real center fan, not a different curved mathematical roof.
+    if (u > 1e-10 && u < 1) return 1 + (Math.max(0, 1 - (radial / u) ** 2) ** 2 - 1) * u;
+    return Math.max(0, 1 - radial * radial) ** 2;
+  };
+  const offsetAt = (x, y, z, fold = 1) => kernel(x, z) *
+    (-.14 * clamp((y + .20) / .35) + fold * (family === 'inward' ? -.09 : .26) * clamp(y / .20));
+  const shadeAt = (x, y, z, fold = 1) => 1 - kernel(x, z) * clamp((y + .20) / .35)
+    * (family === 'outward' ? .28 - .24 * clamp(fold) : .28);
+  const makeTarget = fold => {
+    const positions = [...original], colors = [...originalColors], targetNormals = [...normals];
+    for (let i = 0; i < positions.length; i += 3) {
+      const [x, y, z] = original.slice(i, i + 3);
+      positions[i + 1] += offsetAt(x, y, z, fold);
+      for (let j = 0; j < 3; j++) colors[i / 3 * 4 + j] *= shadeAt(x, y, z, fold);
     }
-    if (Number.isFinite(height)) crackTarget[i + 1] = height + .004;
-  }
+    const before = [], after = [];
+    VertexData.ComputeNormals(original, indices, before); VertexData.ComputeNormals(positions, indices, after);
+    for (let i = 0; i < normals.length; i += 3) {
+      const normal = new Vector3(...normals.slice(i, i + 3).map((v, j) => v + after[i + j] - before[i + j])).normalize();
+      targetNormals.splice(i, 3, normal.x, normal.y, normal.z);
+    }
+    return { positions, normals: targetNormals, colors };
+  };
+  const cracked = makeTarget(0), folded = makeTarget(1);
+  const crackBase = [...crack.getVerticesData('position')];
+  const crackTarget = target => {
+    const result = [...crackBase];
+    for (let i = 0; i < crackBase.length; i += 3) {
+      const x = crackBase[i], z = crackBase[i + 2]; let height = -Infinity;
+      for (let j = 0; j < source.subMeshes[0].indexCount; j += 3) {
+        const a = indices[j] * 3, b = indices[j + 1] * 3, c = indices[j + 2] * 3;
+        const den = (target[b + 2] - target[c + 2]) * (target[a] - target[c]) + (target[c] - target[b]) * (target[a + 2] - target[c + 2]);
+        if (Math.abs(den) < 1e-12) continue;
+        const u = ((target[b + 2] - target[c + 2]) * (x - target[c]) + (target[c] - target[b]) * (z - target[c + 2])) / den;
+        const v = ((target[c + 2] - target[a + 2]) * (x - target[c]) + (target[a] - target[c]) * (z - target[c + 2])) / den;
+        if (u >= -1e-7 && v >= -1e-7 && u + v <= 1 + 1e-7) height = Math.max(height, target[a + 1] * u + target[b + 1] * v + target[c + 1] * (1 - u - v));
+      }
+      if (Number.isFinite(height)) result[i + 1] = height + .004;
+    }
+    return result;
+  };
+  const crackedLine = crackTarget(cracked.positions), foldedLine = crackTarget(folded.positions);
   mesh.setVerticesData('position', original, true); mesh.setVerticesData('normal', normals, true);
   mesh.setVerticesData('terrainAuthoredHeight', original.filter((_, i) => i % 3 === 1), false, 1);
-  mesh.setVerticesData('color', originalColors, true);
-  crack.setVerticesData('position', crackBase, true);
-  return { mesh, depth: .14, update(progress) {
-    mesh.updateVerticesData('position', original.map((v, i) => v + (target[i] - v) * progress), true);
-    mesh.updateVerticesData('normal', normals.map((v, i) => v + (targetNormals[i] - v) * progress));
-    mesh.updateVerticesData('color', originalColors.map((v, i) => v + (depressedColors[i] - v) * progress));
-    crack.updateVerticesData('position', crackBase.map((v, i) => v + (crackTarget[i] - v) * progress), true);
-  } };
+  mesh.setVerticesData('color', originalColors, true); crack.setVerticesData('position', crackBase, true);
+  const blend = (from, to, progress) => from.map((v, i) => v + (to[i] - v) * progress);
+  const apply = (from, to, lineFrom, lineTo, progress) => {
+    mesh.updateVerticesData('position', blend(from.positions, to.positions, progress), true);
+    mesh.updateVerticesData('normal', blend(from.normals, to.normals, progress));
+    mesh.updateVerticesData('color', blend(from.colors, to.colors, progress));
+    crack.updateVerticesData('position', blend(lineFrom, lineTo, progress), true);
+  };
+  return { mesh, depth: .14, family, offsetAt, shadeAt,
+    update(progress) { apply({ positions: original, normals, colors: originalColors }, cracked, crackBase, crackedLine, progress); },
+    fold(progress) { apply(cracked, folded, crackedLine, foldedLine, progress); },
+  };
+}
+
+function bendFragments(fragments, surface) {
+  for (const { mesh } of fragments) {
+    const p = [...mesh.getVerticesData('position')], n = [...mesh.getVerticesData('normal')], colors = [...mesh.getVerticesData('color')];
+    mesh.setVerticesData('terrainAuthoredHeight', p.filter((_, i) => i % 3 === 1), false, 1);
+    for (let i = 0; i < p.length; i += 3) {
+      const [x, y, z] = p.slice(i, i + 3), h = .0001;
+      const dx = (surface.offsetAt(x + h, y, z) - surface.offsetAt(x - h, y, z)) / (2 * h);
+      const dy = (surface.offsetAt(x, y + h, z) - surface.offsetAt(x, y - h, z)) / (2 * h);
+      const dz = (surface.offsetAt(x, y, z + h) - surface.offsetAt(x, y, z - h)) / (2 * h);
+      const ny = n[i + 1] / (1 + dy), normal = new Vector3(n[i] - dx * ny, ny, n[i + 2] - dz * ny).normalize();
+      p[i + 1] += surface.offsetAt(x, y, z); n.splice(i, 3, normal.x, normal.y, normal.z);
+      for (let j = 0; j < 3; j++) colors[i / 3 * 4 + j] *= surface.shadeAt(x, y, z);
+    }
+    mesh.setVerticesData('position', p); mesh.setVerticesData('normal', n); mesh.setVerticesData('color', colors);
+  }
 }
 
 function noise(x, y) {
@@ -991,6 +1015,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     const damage = fractureBlock(terrain.groundTiles[index], { variant });
     const targetHeight = terrain.tileRoots[index].position.y;
     const clearanceFloor = Math.min(...terrain.groundTiles.map(tile => tile.getBoundingInfo().boundingBox.minimum.y * tile.scaling.y + tile.position.y + tile.parent.position.y - targetHeight));
+    damage.clearanceFloor = clearanceFloor;
     damage.motion = createCollapseMotion(index, damage.fragments, { variant, clearanceFloor });
     damage.crack.material = crackMaterial; glow.addExcludedMesh(damage.crack);
     damage.fragments.forEach(({ mesh, volume, topArea, seed, columnConstraints }, part) => {
@@ -1033,7 +1058,8 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       const damage = getDamage(terrain, index), tile = terrain.groundTiles[index];
       terrain.stages[index] = next;
       if (next === 1) {
-        const surface = createCrackedSurface(tile, damage.crack);
+        const surface = createCrackedSurface(tile, damage.crack, { family: damage.motion[0].family });
+        damage.surface = surface;
         damage.crackedShell = surface.mesh;
         shadows.addShadowCaster(surface.mesh); glow.addExcludedMesh(surface.mesh); soilFill.includedOnlyMeshes.push(surface.mesh);
         damage.releaseCrackedShell = () => {
@@ -1052,35 +1078,22 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
           if (terrain === battleTerrain) actors.forEach(actor => { if (actor.data.tile === index) actor.root.position.copyFrom(coord(index)); });
         });
       } else if (next === 2) {
-        damage.releaseCrackedShell?.(); damage.crackedDepression = 0;
-        tile.setEnabled(false); damage.crack.setEnabled(false);
-        terrain.details.filter((mesh) => mesh.parent === terrain.tileRoots[index]).forEach((mesh) => mesh.setEnabled(false));
-        damage.fragments.forEach(({ root, mesh }) => {
-          // Carry the cracked depression into the disposable chunks instead of
-          // popping the central roof back up when the intact shell disappears.
-          const p = [...mesh.getVerticesData('position')], n = [...mesh.getVerticesData('normal')], colors = [...mesh.getVerticesData('color')];
-          mesh.setVerticesData('terrainAuthoredHeight', p.filter((_, i) => i % 3 === 1), false, 1);
-          for (let i = 0; i < p.length; i += 3) {
-            const [x, y, z] = p.slice(i, i + 3), h = .0001;
-            const dx = (crackDepression(x + h, y, z) - crackDepression(x - h, y, z)) / (2 * h);
-            const dy = (crackDepression(x, y + h, z) - crackDepression(x, y - h, z)) / (2 * h);
-            const dz = (crackDepression(x, y, z + h) - crackDepression(x, y, z - h)) / (2 * h);
-            const ny = n[i + 1] / (1 + dy), normal = new Vector3(n[i] - dx * ny, ny, n[i + 2] - dz * ny).normalize();
-            const dip = crackDepression(x, y, z);
-            p[i + 1] += dip; n.splice(i, 3, normal.x, normal.y, normal.z);
-            for (let j = 0; j < 3; j++) colors[i / 3 * 4 + j] *= 1 + dip / .14 * .28;
-          }
-          mesh.setVerticesData('position', p); mesh.setVerticesData('normal', n); mesh.setVerticesData('color', colors); root.setEnabled(true);
-        });
-        await animate(850, (t) => {
-          damage.fragments.forEach(({ root, base }, part) => {
-            const motion = damage.motion[part];
-            const pose = collapsePose(motion, 2, t);
-            root.position.copyFrom(base).addInPlace(pose.offset);
-            root.rotation.copyFrom(pose.rotation);
-          });
+        const surface = damage.surface;
+        await animate(700, (t) => {
+          const progress = ease(t); surface.fold(progress);
+          damage.crackedDepression = -surface.offsetAt(0, TURF_HEIGHT, 0, progress);
+          if (terrain === battleTerrain) actors.forEach(actor => { if (actor.data.tile === index) actor.root.position.copyFrom(coord(index)); });
         });
       } else {
+        // The earth remains whole through stage two. Its complete roof pose is
+        // transferred before the shell is replaced by closed falling pieces.
+        bendFragments(damage.fragments, damage.surface);
+        const family = damage.surface.family;
+        damage.motion = createCollapseMotion(index, damage.fragments, { variant: damage.variant, family, clearanceFloor: damage.clearanceFloor });
+        damage.fragments.forEach(({ root, mesh }, part) => {
+          mesh.metadata.collapseMotion = damage.motion[part]; root.setEnabled(true);
+        });
+        damage.releaseCrackedShell?.(); damage.crackedDepression = 0;
         damage.crack.setEnabled(false); sync(latestState); setFocus(null);
         const starts = damage.fragments.map(({ root }) => ({ position: root.position.clone(), rotation: root.rotation.clone() }));
         await animate(1150, (t) => {
