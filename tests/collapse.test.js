@@ -4,11 +4,12 @@ import { NullEngine } from '@babylonjs/core/Engines/nullEngine.js';
 import { Scene } from '@babylonjs/core/scene.js';
 import { TransformNode } from '@babylonjs/core/Meshes/transformNode.js';
 import { ArcRotateCamera } from '@babylonjs/core/Cameras/arcRotateCamera.js';
-import { Vector3 } from '@babylonjs/core/Maths/math.vector.js';
+import { Vector3, Matrix } from '@babylonjs/core/Maths/math.vector.js';
+import { Ray } from '@babylonjs/core/Culling/ray.js';
 import { createHash } from 'node:crypto';
 import { createNineSliceBlock } from '../src/terrain.js';
 import { fractureBlock } from '../src/collapse.js';
-import { createCollapseMotion, collapsePose } from '../src/scene.js';
+import { createCollapseMotion, collapsePose, createCrackedSurface } from '../src/scene.js';
 
 function inspectSolid(mesh) {
   const positions = mesh.getVerticesData('position'), indices = mesh.getIndices();
@@ -110,6 +111,11 @@ function inspectSupportOrder(tileIndex, fragments, options = {}) {
   const motion = createCollapseMotion(tileIndex, fragments, options);
   assert.deepEqual(motion, createCollapseMotion(tileIndex, fragments, options), 'the same variant and family must reproduce the same motion');
   assert.ok(motion.every(item => item.family === options.family && item.variant === options.variant));
+  for (const item of motion) for (const t of [0, .2, .4, .6, .8, 1]) {
+    const pose = collapsePose(item, 2, t);
+    assert.ok(Math.hypot(pose.offset.x, pose.offset.z) < 1e-9, 'partial collapse must not spread into adjacent tiles');
+    assert.ok(pose.rotation.length() < 1e-9, 'partial collapse must descend without tipping into adjacent tiles');
+  }
   let supportedPairs = 0;
   for (let lower = 0; lower < fragments.length; lower++) {
     for (let upper = 0; upper < fragments.length; upper++) {
@@ -145,22 +151,63 @@ function inspectSupportOrder(tileIndex, fragments, options = {}) {
     }
   }
   if (fragments.length > 8) assert.ok(siblingPairs > 0, 'extra subdivisions must exercise the sibling collision regression');
-  const totalVolume = fragments.reduce((sum, fragment) => sum + fragment.volume, 0);
-  const radius = t => fragments.reduce((sum, fragment, i) => {
-    const settled = fragment.base.add(collapsePose(motion[i], 2, 1).offset);
-    const position = settled.add(collapsePose(motion[i], 3, t).offset);
-    return sum + fragment.volume * Math.hypot(position.x, position.z);
-  }, 0) / totalVolume;
-  if (options.family === 'inward') {
-    assert.ok(radius(.58) < radius(.18) - .02, 'inward chunks must actually converge toward the tile center');
-    assert.ok(motion.every(item => collapsePose(item, 3, .58).fade > .99), 'the convergence must be visible before fading');
-  } else assert.ok(radius(.18) > radius(0) + .02, 'outward chunks must actually spread away from the tile center');
+  const columns = new Map();
+  fragments.forEach((fragment, i) => {
+    if (!columns.has(fragment.supportGroup)) columns.set(fragment.supportGroup, []);
+    columns.get(fragment.supportGroup).push(i);
+  });
+  let visibleTilts = 0;
+  for (const ids of columns.values()) {
+    const radial = ids.reduce((sum, i) => sum.addInPlace(fragments[i].base.scale(fragments[i].volume)), Vector3.Zero());
+    radial.y = 0; radial.normalize();
+    for (const i of ids) for (const t of [.5, .65, .75, .82, .9]) {
+      const pose = collapsePose(motion[i], 3, t), r = pose.rotation;
+      const up = Vector3.TransformNormal(Vector3.Up(), Matrix.RotationYawPitchRoll(r.y, r.x, r.z)).normalize();
+      const lean = Vector3.Dot(up, radial), expectedSign = options.family === 'inward' ? -1 : 1;
+      assert.ok(lean * expectedSign >= -1e-6, 'the actual top orientation must lean in the selected radial direction');
+      if (Math.abs(lean) > .10 && pose.fade > .5) visibleTilts++;
+    }
+  }
+  assert.ok(visibleTilts > 0, 'the family must visibly tip the upper surface rather than only translate its center');
+}
+
+function inspectCrackedSurface(source, crack) {
+  const sourcePositions = [...source.getVerticesData('position')], crackPositions = [...crack.getVerticesData('position')];
+  const sourceColors = [...source.getVerticesData('color')];
+  const surface = createCrackedSurface(source, crack);
+  assert.notEqual(surface.mesh.geometry, source.geometry, 'subsidence needs a separate restorable geometry');
+  assert.ok(!source.isVerticesDataPresent('terrainAuthoredHeight'), 'damage cannot add shader inputs to the intact source');
+  assert.deepEqual(surface.mesh.getVerticesData('terrainAuthoredHeight'), sourcePositions.filter((_, i) => i % 3 === 1), 'texture blending must keep the original material height while geometry sinks');
+  const topCount = source.metadata.nineSlice.topVertexCount;
+  const center = Array.from({ length: topCount }, (_, i) => i).reduce((best, i) => Math.hypot(sourcePositions[i * 3], sourcePositions[i * 3 + 2]) < Math.hypot(sourcePositions[best * 3], sourcePositions[best * 3 + 2]) ? i : best, 0);
+  surface.update(.5);
+  const halfDepth = sourcePositions[center * 3 + 1] - surface.mesh.getVerticesData('position')[center * 3 + 1];
+  surface.update(1); surface.mesh.computeWorldMatrix(true);
+  const depressed = surface.mesh.getVerticesData('position'), depth = sourcePositions[center * 3 + 1] - depressed[center * 3 + 1];
+  assert.ok(depth >= .12 && depth <= .16 && halfDepth > 0 && halfDepth < depth, 'stage one must visibly lower the center progressively');
+  for (let i = 0; i < depressed.length; i += 3) {
+    assert.ok(depressed[i] === sourcePositions[i] && depressed[i + 2] === sourcePositions[i + 2]);
+    if (Math.max(Math.abs(sourcePositions[i]), Math.abs(sourcePositions[i + 2])) > .47) assert.equal(depressed[i + 1], sourcePositions[i + 1], 'the outer tile boundary must stay fixed');
+  }
+  inspectSolid(surface.mesh);
+  const marks = crack.getVerticesData('position'), stride = Math.max(1, Math.floor(marks.length / 3 / 20));
+  for (let vertex = 0; vertex < marks.length / 3; vertex += stride) {
+    const i = vertex * 3, hit = surface.mesh.intersects(new Ray(new Vector3(marks[i], 2, marks[i + 2]), new Vector3(0, -1, 0)), false);
+    assert.ok(hit.hit, 'the crack must stay over the deformed turf');
+    assert.ok(Math.abs(marks[i + 1] - hit.pickedPoint.y - .004) < 1e-5, 'the crack must follow the actual triangles instead of floating above the depression');
+  }
+  assert.deepEqual(source.getVerticesData('position'), sourcePositions, 'subsidence cannot deform the intact source');
+  surface.update(0);
+  assert.ok(surface.mesh.getVerticesData('position').every((value, i) => value === sourcePositions[i]));
+  assert.deepEqual(surface.mesh.getVerticesData('color'), sourceColors, 'resetting the damaged copy must also remove its local depression shading');
+  assert.deepEqual(crack.getVerticesData('position'), crackPositions);
+  surface.mesh.dispose();
 }
 
 test('rounded fragments have closed cut faces, bounded remeshing and preserved source attributes', () => {
   const engine = new NullEngine(), scene = new Scene(engine);
   try {
-    for (const [seed, variant] of [[0, 0], [0, 1], [12, 0], [24, 0]]) {
+    for (const [seed, variant] of [[0, 0], [0, 1], [12, 0], [24, 0], [19, 19]]) {
       const source = createNineSliceBlock(scene, seed), sourceVolume = inspectSolid(source);
       source.metadata.tileIndex = seed;
       const original = new Map(['position', 'normal', 'uv', 'color', 'terrainStoneUV', 'terrainBottomLight'].map(kind => [kind, [...source.getVerticesData(kind)]]));
@@ -170,6 +217,7 @@ test('rounded fragments have closed cut faces, bounded remeshing and preserved s
       assert.equal(result.variant, variant);
       assert.ok(result.fragments.length >= 8 && result.fragments.length <= 12, 'each tile must partition into 8–12 solid fragments');
       inspectVolumeCuts(result.fragments);
+      inspectCrackedSurface(source, result.crack);
       for (const family of ['inward', 'outward']) inspectSupportOrder(seed, result.fragments, { family, variant });
       const naturalMotion = createCollapseMotion(seed, result.fragments, { variant });
       assert.deepEqual(naturalMotion, createCollapseMotion(seed, result.fragments, { variant, family: naturalMotion[0].family }), 'forcing the selected family must reproduce the natural seeded path');
@@ -232,6 +280,33 @@ test('tile identity and reset variants change real partitions while camera and b
     assert.equal(crackHashes.size, 4, 'different tiles and variants must show different crack paths');
     assert.notDeepEqual(variantVolumes.get(0), variantVolumes.get(1), 'a new variant must repartition the solid, not only rotate an identical set of chunks');
     source.dispose(); parent.dispose(); camera.dispose();
+    assert.equal(scene.meshes.length, 0); assert.equal(scene.transformNodes.length, 0);
+  } finally { scene.dispose(); engine.dispose(); }
+});
+
+test('a failed fragment allocation rolls back partial meshes and permits a clean retry', () => {
+  const engine = new NullEngine(), scene = new Scene(engine);
+  try {
+    const source = createNineSliceBlock(scene, 0); source.metadata.tileIndex = 0;
+    const baseline = { meshes: scene.meshes.length, nodes: scene.transformNodes.length, geometries: scene.geometries.length };
+    const originalPositions = [...source.getVerticesData('position')], addMesh = scene.addMesh;
+    let allocatedFragments = 0;
+    scene.addMesh = function(mesh, ...args) {
+      const result = addMesh.call(this, mesh, ...args);
+      if (mesh.name.includes('-fragment-') && ++allocatedFragments === 2) throw new Error('injected fracture allocation failure');
+      return result;
+    };
+    try { assert.throws(() => fractureBlock(source), /injected fracture allocation failure/); }
+    finally { scene.addMesh = addMesh; }
+    assert.equal(allocatedFragments, 2, 'the failure must occur after partial fragment construction');
+    assert.deepEqual({ meshes: scene.meshes.length, nodes: scene.transformNodes.length, geometries: scene.geometries.length }, baseline, 'failed construction must release every partial mesh, transform and buffer');
+    assert.deepEqual(source.getVerticesData('position'), originalPositions);
+    const retry = fractureBlock(source);
+    assert.ok(retry.fragments.length >= 8 && retry.fragments.length <= 12);
+    assert.ok(retry.fragments.every(({root}) => !root.isEnabled()), 'new pieces must remain hidden until their stage is displayed');
+    retry.dispose();
+    assert.deepEqual({ meshes: scene.meshes.length, nodes: scene.transformNodes.length, geometries: scene.geometries.length }, baseline);
+    source.dispose();
     assert.equal(scene.meshes.length, 0); assert.equal(scene.transformNodes.length, 0);
   } finally { scene.dispose(); engine.dispose(); }
 });

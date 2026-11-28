@@ -34,17 +34,18 @@ function measure(faces) {
 const key = v => v.slice(0,3).map(x => x.toFixed(7)).join(',');
 const mix = (a,b,t) => a.map((x,i) => x+(b[i]-x)*t);
 const distance = (v,p) => dot(v,p)-p[3];
-function fractureSurface(plane,phase) {
+function fractureSurface(plane,phase,vertical=false) {
   const [u,v]=planeBasis(plane);
   const height=(x,y)=>.032*Math.sin(x*15+phase)*Math.cos(y*12+phase*.73)+.014*Math.sin(x*24+y*8+phase*1.37);
-  const field=point=>distance(point,plane)-height(dot(point,u),dot(point,v));
+  const sample=point=>vertical?[point[0],.245,point[2]]:point;
+  const field=point=>{const p=sample(point);return distance(p,plane)-height(dot(p,u),dot(p,v));};
   const project=point=>{
     const offset=field(point);for(let i=0;i<3;i++)point[i]-=plane[i]*offset;
     return point;
   };
   const normal=point=>{
-    const x=dot(point,u),y=dot(point,v),du=.48*Math.cos(x*15+phase)*Math.cos(y*12+phase*.73)+.336*Math.cos(x*24+y*8+phase*1.37);
-    const dv=-.384*Math.sin(x*15+phase)*Math.sin(y*12+phase*.73)+.112*Math.cos(x*24+y*8+phase*1.37);
+    const p=sample(point),x=dot(p,u),y=dot(p,v),du=.48*Math.cos(x*15+phase)*Math.cos(y*12+phase*.73)+.336*Math.cos(x*24+y*8+phase*1.37);
+    const dv=vertical?0:-.384*Math.sin(x*15+phase)*Math.sin(y*12+phase*.73)+.112*Math.cos(x*24+y*8+phase*1.37);
     return unit(plane.slice(0,3).map((value,i)=>value-u[i]*du-v[i]*dv));
   };
   return {field,project,normal};
@@ -116,20 +117,38 @@ function sourceSampler(faces) {
     const [a,b,c]=best.face.v,w=best.weights;
     best.value=a.map((_,i)=>a[i]*w[0]+b[i]*w[1]+c[i]*w[2]);return best;
   };
-  return {column,nearest,clearColumns:()=>columns.clear()};
+  return {column,nearest,bounds:{min:tree.min,max:tree.max},clearColumns:()=>columns.clear()};
 }
 
 function roundedFragment(piece,sampler,interiorOffset) {
   const radius=Math.min(.05,Math.min(...piece.extent)*.18),spacing=radius/4.2,padding=radius+spacing*2;
   const start=piece.min.map(v=>Math.floor((v-padding)/spacing)),end=piece.max.map(v=>Math.ceil((v+padding)/spacing));
-  const [nx,ny,nz]=end.map((v,j)=>v-start[j]+1),origin=start.map(v=>v*spacing),occupancy=new Uint8Array(nx*ny*nz);
-  for(let z=0;z<nz;z++)for(let x=0;x<nx;x++){
-    const px=origin[0]+x*spacing,pz=origin[2]+z*spacing,hits=sampler.column(px,pz);if(hits.length<2)continue;
-    for(let y=0;y<ny;y++){
-      const py=origin[1]+y*spacing;let inside=false;
-      for(let j=0;j+1<hits.length;j+=2)if(py>=hits[j]&&py<=hits[j+1]){inside=true;break;}
-      if(!inside)continue;
-      const point=[px,py,pz];if(piece.constraints.every(c=>c.surface.field(point)*c.side<=0))occupancy[x+nx*(y+ny*z)]=1;
+  let nx,ny,nz,origin,occupancy;
+  // Partition samples estimate bounds; a curved cut can include source voxels
+  // beyond that estimate. Grow only affected grids before opening the solid.
+  for(let expansion=0;;expansion++){
+    [nx,ny,nz]=end.map((v,j)=>v-start[j]+1);origin=start.map(v=>v*spacing);occupancy=new Uint8Array(nx*ny*nz);
+    const touches=[false,false,false,false,false,false];
+    for(let z=0;z<nz;z++)for(let x=0;x<nx;x++){
+      const px=origin[0]+x*spacing,pz=origin[2]+z*spacing,hits=sampler.column(px,pz);if(hits.length<2)continue;
+      for(let y=0;y<ny;y++){
+        const py=origin[1]+y*spacing;let inside=false;
+        for(let j=0;j+1<hits.length;j+=2)if(py>=hits[j]&&py<=hits[j+1]){inside=true;break;}
+        if(!inside)continue;
+        const point=[px,py,pz];if(piece.constraints.every(c=>c.surface.field(point)*c.side<=0)){
+          occupancy[x+nx*(y+ny*z)]=1;
+          if(x===0)touches[0]=true;if(x===nx-1)touches[1]=true;
+          if(y===0)touches[2]=true;if(y===ny-1)touches[3]=true;
+          if(z===0)touches[4]=true;if(z===nz-1)touches[5]=true;
+        }
+      }
+    }
+    if(!touches.some(Boolean))break;
+    if(expansion===4)throw new Error('Fracture occupancy exceeded the padded source bounds.');
+    const growth=Math.ceil(padding/spacing);
+    for(let axis=0;axis<3;axis++){
+      if(expansion===3){start[axis]=Math.floor((sampler.bounds.min[axis]-padding)/spacing);end[axis]=Math.ceil((sampler.bounds.max[axis]+padding)/spacing);}
+      else {if(touches[axis*2])start[axis]-=growth;if(touches[axis*2+1])end[axis]+=growth;}
     }
   }
   const solid=roundVoxelSolid({occupancy,nx,ny,nz,origin,spacing,radius}),faces=[],nodes=new Map(),records=new Map(),crossings=new Map();
@@ -191,7 +210,25 @@ function roundedFragment(piece,sampler,interiorOffset) {
   }
   return {faces,stats:{...solid.stats,cellSize:spacing,radius}};
 }
-export function fractureBlock(source, {variant=0} = {}) {
+export function fractureBlock(source, options = {}) {
+  const scene=source.getScene(),meshes=new Set(scene.meshes),roots=new Set(scene.transformNodes);
+  try { return buildFracture(source,options); }
+  catch(error) {
+    // A later fragment may fail after earlier meshes were allocated. None of
+    // those partial results has an owner yet, so roll back the whole call.
+    scene.meshes.filter(mesh=>!meshes.has(mesh)).forEach(mesh=>{
+      try { mesh.dispose(false,false); }
+      // Babylon registers a mesh before its constructor initializes disposal
+      // data. An allocation failure there still needs scene deregistration.
+      catch { scene.removeMesh(mesh); }
+    });
+    scene.transformNodes.filter(root=>!roots.has(root)).forEach(root=>{
+      try { root.dispose(); } catch { scene.removeTransformNode(root); }
+    });
+    throw error;
+  }
+}
+function buildFracture(source, {variant=0} = {}) {
   if(!Number.isInteger(variant)||variant<0||variant>0xffffffff)throw new RangeError('Fracture variant must be an unsigned 32-bit integer.');
   const scene=source.getScene(),position=source.getVerticesData('position'),normal=source.getVerticesData('normal'),uv=source.getVerticesData('uv'),color=source.getVerticesData('color'),stone=source.getVerticesData('terrainStoneUV'),bottom=source.getVerticesData('terrainBottomLight');
   const vertices=Array.from({length:position.length/3},(_,i)=>[...position.slice(i*3,i*3+3),...normal.slice(i*3,i*3+3),...uv.slice(i*2,i*2+2),...color.slice(i*4,i*4+4),...stone.slice(i*2,i*2+2),bottom[i]]);
@@ -236,13 +273,16 @@ export function fractureBlock(source, {variant=0} = {}) {
         // Four load-bearing columns remain, but their independent cut headings
         // and unequal areas no longer form the same axis-aligned quarter grid.
         const heading=columnHeading+(split?Math.PI/2+(random()-.5)*1.05:0);
-        components=[Math.cos(heading),(random()-.5)*.24,Math.sin(heading)];
+        random(); // Retain the seeded sequence when removing the old Y tilt.
+        components=[Math.cos(heading),0,Math.sin(heading)];
       }else{
         const slope=()=> (random()-.5)*(split<7?.46:1.0);
         components=[slope(),slope(),slope()];components[axis]=1;
       }
       const normal=unit(components);
-      plane=[...normal,0];surface=fractureSurface(plane,(seed%1024)*.013+split*2.39);
+      // Curved column walls are vertical extrusions: different columns can
+      // fall straight down without interlocking. Height cuts remain fully 3D.
+      plane=[...normal,0];surface=fractureSurface(plane,(seed%1024)*.013+split*2.39,split<3);
       // Quantiles of the actual curved cut field vary fragment sizes while
       // ensuring both children retain substantial source material.
       const projections=piece.points.map(point=>surface.field(point)).sort((a,b)=>a-b);
@@ -281,6 +321,7 @@ export function fractureBlock(source, {variant=0} = {}) {
     const rounded=roundedFragment(pieces[part],sampler,interiorOffset),faces=rounded.faces;
     const {center:centroid,volume,topArea,min,max}=measure(faces), center=new Vector3(...centroid);
     const supportGroup=pieces[part].constraints.filter(c=>c.cutId<3).map(c=>`${c.cutId}:${c.side}`).join('|');
+    const columnConstraints=pieces[part].constraints.filter(c=>c.cutId<3).map(c=>({cutId:c.cutId,side:c.side,field:c.surface.field}));
     const heightCut=pieces[part].constraints.find(c=>c.cutId>=3&&c.cutId<7);
     const supportLayer=heightCut.side===1?0:1;
     const p=[],n=[],u=[],c=[],s=[],light=[],indices=[],vertexIds=new Map();
@@ -298,7 +339,7 @@ export function fractureBlock(source, {variant=0} = {}) {
       const indexStart=indices.length;faces.filter(f=>f.mat===2&&f.cutId===id).forEach(append);
       cutSurfaces.push({id,indexStart,indexCount:indices.length-indexStart});
     }
-    const root=new TransformNode(`${source.name}-fracture-root-${part}`,scene);root.parent=source.parent;
+    const root=new TransformNode(`${source.name}-fracture-root-${part}`,scene);root.setEnabled(false);root.parent=source.parent;
     const scaledCenter=center.multiply(source.scaling);
     root.position.copyFrom(source.position.add(scaledCenter));
     const mesh=new Mesh(`${source.name}-fragment-${part}`,scene),data=new VertexData();
@@ -310,7 +351,7 @@ export function fractureBlock(source, {variant=0} = {}) {
     new SubMesh(2,exteriorVertices,p.length/3-exteriorVertices,exteriorIndices,indices.length-exteriorIndices,mesh);
     mesh.parent=root;mesh.position.copyFrom(scaledCenter.negate());mesh.scaling.copyFrom(source.scaling);mesh.material=source.material;mesh.receiveShadows=true;
     mesh.metadata={tileIndex:source.metadata.tileIndex,destructionFragment:true,fragmentIndex:part,fractureVariant:variant,cutSurfaces,roundedSolid:rounded.stats};
-    fragments.push({root,mesh,base:root.position.clone(),part,center,volume,topArea,supportGroup,supportLayer,bounds:{min,max},seed:(seed+Math.imul(part+1,0x27d4eb2d))>>>0});
+    fragments.push({root,mesh,base:root.position.clone(),part,center,volume,topArea,supportGroup,supportLayer,columnConstraints,bounds:{min,max},seed:(seed+Math.imul(part+1,0x27d4eb2d))>>>0});
   }
   const positions=[],indices=[],neighbors=new Map(),edgePoints=new Map();
   // Follow the actual curved turf intersection as connected polylines. Branches

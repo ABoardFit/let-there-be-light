@@ -65,8 +65,8 @@ function randomSource(seed) {
 }
 
 // Columns preserve their original support hierarchy throughout the collapse.
-// Shared lateral motion opens clearance before the lower soil releases the turf.
-export function createCollapseMotion(tileIndex, fragments, { family, variant = 0 } = {}) {
+// Soil releases vertically first; radial tangent axes control the later tumble.
+export function createCollapseMotion(tileIndex, fragments, { family, variant = 0, clearanceFloor } = {}) {
   const seed = (13007 + tileIndex * 8191 + Math.imul(variant, 104729)) >>> 0;
   const random = randomSource(seed);
   const seededFamily = random() < .5 ? 'inward' : 'outward';
@@ -95,11 +95,12 @@ export function createCollapseMotion(tileIndex, fragments, { family, variant = 0
       + (ratio < .35 || ratio > .55 ? 10 : 0);
     if (score < bestScore) { bestScore = score; bestMask = mask; }
   }
+  const releaseOrder = [...columns.keys()].sort((a, b) => preference[a] - preference[b]);
   columns.forEach((group, i) => {
     group.affected = !!(bestMask & (1 << i));
-    group.drop = .36 + random() * .09;
-    group.open = new Vector3(group.center.x * .70, 0, group.center.z * .70);
-    group.drift = new Vector3(group.center.x * .65, 0, group.center.z * .65);
+    group.releaseRank = releaseOrder.indexOf(i);
+    group.drop = .10 + random() * .06;
+
     group.lag = random() * .08;
     group.strength = .94 + random() * .12;
     group.layers = [0, 1].map(layer => {
@@ -107,24 +108,138 @@ export function createCollapseMotion(tileIndex, fragments, { family, variant = 0
       const volume = siblings.reduce((sum, fragment) => sum + fragment.volume, 0);
       const pivot = siblings.reduce((sum, fragment) => sum.addInPlace(fragment.base.scale(fragment.volume)), Vector3.Zero()).scaleInPlace(1 / volume);
       const r = randomSource(siblings[0].seed ^ seed);
-      return { pivot,
-        spin: new Vector3((r() - .5) * .65, (r() - .5) * .55, (r() - .5) * .65) };
+      const low = new Vector3(Infinity, Infinity, Infinity), high = new Vector3(-Infinity, -Infinity, -Infinity);
+      siblings.forEach(fragment => {
+        const origin = fragment.base.add(fragment.mesh.position);
+        for (const axis of ['x', 'y', 'z']) {
+          const j = { x: 0, y: 1, z: 2 }[axis];
+          low[axis] = Math.min(low[axis], origin[axis] + fragment.bounds.min[j] * fragment.mesh.scaling[axis]);
+          high[axis] = Math.max(high[axis], origin[axis] + fragment.bounds.max[j] * fragment.mesh.scaling[axis]);
+        }
+      });
+      // Choose the tile edge facing away from the center as the hinge. A pure
+      // X/Z hinge avoids a diagonal AABB corner sweeping into the next tile.
+      const axis = Math.abs(group.center.x) >= Math.abs(group.center.z) ? 'x' : 'z';
+      const direction = Math.sign(group.center[axis]) || 1;
+      pivot[axis] = direction > 0 ? high[axis] : low[axis];
+      pivot.y = family === 'inward' ? low.y : high.y;
+      const radius = Math.hypot(...['x', 'y', 'z'].map(axis => Math.max(Math.abs(low[axis] - pivot[axis]), Math.abs(high[axis] - pivot[axis]))));
+      const radial = axis === 'x' ? new Vector3(direction, 0, 0) : new Vector3(0, 0, direction);
+      const angle = .95 + r() * .25, sign = family === 'inward' ? -1 : 1;
+      return { pivot, low, high, radius, spin: new Vector3(radial.z * angle * sign, 0, -radial.x * angle * sign) };
     });
   });
-  // Recover part of the opened gap toward the original tile footprint.
-  // The remaining clearance keeps neighboring columns apart while soil drops.
-  return fragments.map(fragment => {
+  const tileBottom = Math.min(clearanceFloor ?? Infinity, ...columns.flatMap(group => group.layers.map(layer => layer.low.y)));
+  const layers = columns.flatMap(group => group.layers);
+  const footprint = {
+    minX: Math.min(...layers.map(layer => layer.low.x)), maxX: Math.max(...layers.map(layer => layer.high.x)),
+    minZ: Math.min(...layers.map(layer => layer.low.z)), maxZ: Math.max(...layers.map(layer => layer.high.z)),
+  };
+  const motions = fragments.map(fragment => {
     const group = groups.get(fragment.supportGroup), lower = fragment.supportLayer === 0;
     const layer = group.layers[fragment.supportLayer];
-    const settle = group.open.clone();
-    settle.y = group.affected ? -(group.drop + (lower ? .32 : 0)) : 0;
+    const settle = new Vector3(0, group.affected ? -(group.drop + (lower ? .18 : 0)) : 0, 0);
     return { affected: group.affected, supportGroup: group.id, supportLayer: fragment.supportLayer, family, variant, seed,
       settle, tilt: Vector3.Zero(), lag: (lower ? .30 : .46) + group.lag,
-      fallLag: (lower ? (family === 'inward' ? .08 : .18) : (family === 'inward' ? .24 : .32)) + group.lag, fallDistance: (lower ? 4.6 : 3.2) * group.strength,
-      fallDrift: group.drift.clone(), fallPivotOffset: fragment.base.subtract(layer.pivot),
-      inwardDrift: group.open.scale(-.60),
-      fallSpin: layer.spin.scale(family === 'inward' ? .45 : 1) };
+      fallLag: lower ? group.releaseRank * .025 : [.02, .08, .14, .62][group.releaseRank],
+      fallDistance: (lower ? 7.8 - group.releaseRank * .5 : [6.0, 5.4, 4.8, 3.1][group.releaseRank]) * group.strength,
+      fallDrift: Vector3.Zero(), fallPivotOffset: fragment.base.subtract(layer.pivot),
+      layerPivotY: layer.pivot.y, layerRadius: layer.radius, tileBottom,
+      fallSpin: layer.spin.clone() };
   });
+  const entries = layers.map(layer => {
+    const ids = fragments.flatMap((fragment, i) => groups.get(fragment.supportGroup).layers[fragment.supportLayer] === layer ? [i] : []);
+    const first = fragments[ids[0]], origin = first.base.add(first.mesh.position), scale = first.mesh.scaling.clone(), points = [];
+    const low = new Vector3(Infinity, Infinity, Infinity), high = new Vector3(-Infinity, -Infinity, -Infinity);
+    for (const id of ids) {
+      const fragment = fragments[id], p = fragment.mesh.getVerticesData('position');
+      const warped = fragment.mesh.isVerticesDataPresent('terrainAuthoredHeight');
+      for (let j = 0; j < p.length; j += 3) {
+        const x = p[j] * scale.x + origin.x, y = (p[j + 1] + (warped ? 0 : crackDepression(p[j], p[j + 1], p[j + 2]))) * scale.y + origin.y, z = p[j + 2] * scale.z + origin.z;
+        points.push(x, y, z); low.x = Math.min(low.x, x); low.y = Math.min(low.y, y); low.z = Math.min(low.z, z);
+        high.x = Math.max(high.x, x); high.y = Math.max(high.y, y); high.z = Math.max(high.z, z);
+      }
+    }
+    const constraints = (first.columnConstraints || []).map(c => {
+      let limit = 0;
+      for (let i = 0; i < points.length; i += 3) limit = Math.max(limit, c.field([(points[i] - origin.x) / scale.x, 0, (points[i + 2] - origin.z) / scale.z]) * c.side);
+      return { ...c, limit: limit + .0001 };
+    });
+    return { ...layer, ids, origin, scale, points, low, high, constraints, motion: motions[ids[0]] };
+  });
+  const plan = makeRollPlan(entries, footprint, tileBottom);
+  entries.forEach((entry, index) => entry.ids.forEach(id => {
+    Object.defineProperty(motions[id], 'rollPlan', { value: plan, writable: true });
+    motions[id].rollLayer = index;
+  }));
+  return motions;
+}
+
+function makeRollPlan(entries, footprint, tileBottom) {
+  let cachedTime = -1, cachedAngles;
+  const smooth = value => { const x = clamp(value); return x * x * (3 - 2 * x); };
+  const boundsY = (entry, fraction, drop) => {
+    const angle = (entry.spin.x || entry.spin.z) * fraction, c = Math.cos(angle), s = Math.sin(angle);
+    let min = Infinity, max = -Infinity;
+    for (const x of [entry.low.x, entry.high.x]) for (const y of [entry.low.y, entry.high.y]) for (const z of [entry.low.z, entry.high.z]) {
+      const q = (entry.spin.x ? -(z - entry.pivot.z) : x - entry.pivot.x) * s + (y - entry.pivot.y) * c + entry.pivot.y + drop;
+      min = Math.min(min, q); max = Math.max(max, q);
+    }
+    return [min, max];
+  };
+  return { sample(t) {
+    if (cachedTime === t) return cachedAngles;
+    cachedTime = t;
+    const desired = smooth((t - .18) / .46);
+    const drops = entries.map(({ motion }) => {
+      const fall = clamp((t - motion.fallLag) / (1 - motion.fallLag));
+      return motion.settle.y - .18 * fall - motion.fallDistance * fall * fall;
+    });
+    // Conservative swept Y envelopes cover every angle up to the requested
+    // angle. A neighboring column releases its shared boundary only when the
+    // complete rotated layers are vertically separated.
+    const sweeps = entries.map((entry, i) => {
+      const ranges = [0, .25, .5, .75, 1].map(k => boundsY(entry, desired * k, drops[i]));
+      return [Math.min(...ranges.map(r => r[0])) - .02, Math.max(...ranges.map(r => r[1])) + .02];
+    });
+    const overlap = (a, b) => a[0] < b[1] + .008 && b[0] < a[1] + .008;
+    cachedAngles = entries.map((entry, index) => {
+      const valid = fraction => {
+        if (fraction < 1e-8) return true;
+        const range = boundsY(entry, fraction, drops[index]);
+        for (let j = 0; j < entries.length; j++) {
+          if (j !== index && entries[j].motion.supportGroup === entry.motion.supportGroup && overlap(range, sweeps[j])) return false;
+        }
+        const active = entry.constraints.filter(c => entries.some((other, j) => j !== index &&
+          other.constraints.some(d => d.cutId === c.cutId && d.side !== c.side) && overlap(range, sweeps[j])));
+        const protectTile = range[1] >= tileBottom - .01;
+        if (!protectTile && !active.length) return true;
+        const angle = (entry.spin.x || entry.spin.z) * fraction, cosine = Math.cos(angle), sine = Math.sin(angle);
+        const p = entry.points, pivot = entry.pivot;
+        for (let k = 0; k < p.length; k += 3) {
+          const dx = p[k] - pivot.x, dy = p[k + 1] - pivot.y, dz = p[k + 2] - pivot.z;
+          const x = entry.spin.x ? p[k] : dx * cosine - dy * sine + pivot.x;
+          const z = entry.spin.x ? dy * sine + dz * cosine + pivot.z : p[k + 2];
+          if (protectTile && (x < footprint.minX - 1e-6 || x > footprint.maxX + 1e-6 || z < footprint.minZ - 1e-6 || z > footprint.maxZ + 1e-6)) return false;
+          const local = [(x - entry.origin.x) / entry.scale.x, 0, (z - entry.origin.z) / entry.scale.z];
+          for (const constraint of active) if (constraint.field(local) * constraint.side > constraint.limit) return false;
+        }
+        return true;
+      };
+      let low = 0, high = desired;
+      // Prefix search never jumps across an unsafe interval into a later pose.
+      for (let step = 1; step <= 6; step++) {
+        const candidate = desired * step / 6;
+        if (!valid(candidate)) { high = candidate; break; }
+        low = candidate;
+      }
+      for (let step = 0; step < 8 && high - low > .0005; step++) {
+        const mid = (low + high) / 2; if (valid(mid)) low = mid; else high = mid;
+      }
+      return low;
+    });
+    return cachedAngles;
+  } };
 }
 
 // Both the renderer and diagnostics use this trajectory. Rotation waits until
@@ -132,20 +247,70 @@ export function createCollapseMotion(tileIndex, fragments, { family, variant = 0
 export function collapsePose(motion, stage, t) {
   const smooth = value => { const x = clamp(value); return x * x * (3 - 2 * x); };
   if (stage === 2) {
-    const open = smooth(t / .30), drop = smooth((t - motion.lag) / (1 - motion.lag));
-    return { offset: new Vector3(motion.settle.x * open, motion.settle.y * drop, motion.settle.z * open), rotation: Vector3.Zero(), fade: 1 };
+    const drop = smooth((t - motion.lag) / (1 - motion.lag));
+    return { offset: new Vector3(0, motion.settle.y * drop, 0), rotation: Vector3.Zero(), fade: 1 };
   }
-  const opening = smooth(t / .18), fall = clamp((t - motion.fallLag) / (1 - motion.fallLag));
-  const inward = motion.family === 'inward';
-  const offset = inward ? motion.inwardDrift.scale(smooth((t - .18) / .40)) : motion.fallDrift.scale(opening);
+  const fall = clamp((t - motion.fallLag) / (1 - motion.fallLag));
+  const offset = Vector3.Zero();
   offset.y = -(.18 * fall + motion.fallDistance * fall * fall);
-  const spin = smooth((t - (inward ? .76 : .68)) / (inward ? .24 : .32));
+  const spin = motion.rollPlan.sample(t)[motion.rollLayer];
   const rotation = motion.fallSpin.scale(spin);
   // Adjacent siblings rotate as one rigid layer, rather than turning into each
   // other around separate centers. Their existing gap is preserved exactly.
   const transform = Matrix.RotationYawPitchRoll(rotation.y, rotation.x, rotation.z);
   offset.addInPlace(Vector3.TransformCoordinates(motion.fallPivotOffset, transform).subtract(motion.fallPivotOffset));
-  return { offset, rotation, fade: 1 - smooth((t - (inward ? .62 : .48)) / (inward ? .37 : .48)) };
+  return { offset, rotation, fade: 1 - smooth((t - .82) / .18) };
+}
+
+// Stage one owns a disposable copy; the restorable source and its cached
+// fracture sampler never receive a vertex edit.
+const crackDepression = (x, y, z) => {
+  const radius = Math.max(Math.abs(x), Math.abs(z)) / .445;
+  return -.14 * Math.max(0, 1 - radius * radius) ** 2 * clamp((y + .20) / .35);
+};
+export function createCrackedSurface(source, crack) {
+  const mesh = source.clone(`${source.name}-cracked-surface`, source.parent, true);
+  mesh.makeGeometryUnique(); mesh.metadata = { ...source.metadata, crackedTerrain: true };
+  const original = [...source.getVerticesData('position')], normals = [...source.getVerticesData('normal')];
+  const originalColors = [...source.getVerticesData('color')], depressedColors = [...originalColors];
+  const target = [...original], targetNormals = [...normals], indices = source.getIndices();
+  for (let i = 0; i < original.length; i += 3) {
+    const dip = crackDepression(...original.slice(i, i + 3));
+    target[i + 1] += dip;
+    const shade = 1 + dip / .14 * .28;
+    for (let j = 0; j < 3; j++) depressedColors[i / 3 * 4 + j] *= shade;
+  }
+  const beforeNormals = [], afterNormals = [];
+  VertexData.ComputeNormals(original, indices, beforeNormals); VertexData.ComputeNormals(target, indices, afterNormals);
+  for (let i = 0; i < normals.length; i += 3) {
+    const normal = new Vector3(...normals.slice(i, i + 3).map((v, j) => v + afterNormals[i + j] - beforeNormals[i + j])).normalize();
+    targetNormals.splice(i, 3, normal.x, normal.y, normal.z);
+  }
+  const crackBase = [...crack.getVerticesData('position')], crackTarget = [...crackBase];
+  // Match the actual triangulated turf, including large central triangles,
+  // instead of letting a curved mathematical crack float above a flat face.
+  for (let i = 0; i < crackBase.length; i += 3) {
+    const x = crackBase[i], z = crackBase[i + 2]; let height = -Infinity;
+    for (let j = 0; j < source.subMeshes[0].indexCount; j += 3) {
+      const a = indices[j] * 3, b = indices[j + 1] * 3, c = indices[j + 2] * 3;
+      const den = (target[b + 2] - target[c + 2]) * (target[a] - target[c]) + (target[c] - target[b]) * (target[a + 2] - target[c + 2]);
+      if (Math.abs(den) < 1e-12) continue;
+      const u = ((target[b + 2] - target[c + 2]) * (x - target[c]) + (target[c] - target[b]) * (z - target[c + 2])) / den;
+      const v = ((target[c + 2] - target[a + 2]) * (x - target[c]) + (target[a] - target[c]) * (z - target[c + 2])) / den;
+      if (u >= -1e-7 && v >= -1e-7 && u + v <= 1 + 1e-7) height = Math.max(height, target[a + 1] * u + target[b + 1] * v + target[c + 1] * (1 - u - v));
+    }
+    if (Number.isFinite(height)) crackTarget[i + 1] = height + .004;
+  }
+  mesh.setVerticesData('position', original, true); mesh.setVerticesData('normal', normals, true);
+  mesh.setVerticesData('terrainAuthoredHeight', original.filter((_, i) => i % 3 === 1), false, 1);
+  mesh.setVerticesData('color', originalColors, true);
+  crack.setVerticesData('position', crackBase, true);
+  return { mesh, depth: .14, update(progress) {
+    mesh.updateVerticesData('position', original.map((v, i) => v + (target[i] - v) * progress), true);
+    mesh.updateVerticesData('normal', normals.map((v, i) => v + (targetNormals[i] - v) * progress));
+    mesh.updateVerticesData('color', originalColors.map((v, i) => v + (depressedColors[i] - v) * progress));
+    crack.updateVerticesData('position', crackBase.map((v, i) => v + (crackTarget[i] - v) * progress), true);
+  } };
 }
 
 function noise(x, y) {
@@ -175,14 +340,18 @@ function grassHemOffset(seed, x, z) {
 // Authored stone UVs and mesh-local height remain attached through rotation and drops.
 class SharedEarthBlend extends MaterialPluginBase {
   constructor(material, earthTexture, fillTransparentStone = false) {
-    super(material, 'SharedEarthBlend', 190, { SHARED_EARTH_BLEND: true, SHARED_EARTH_FILL: fillTransparentStone }, true, true);
+    super(material, 'SharedEarthBlend', 190, { SHARED_EARTH_BLEND: true, SHARED_EARTH_FILL: fillTransparentStone, TERRAIN_AUTHORED_HEIGHT: false }, true, true);
     this.earthTexture = earthTexture;
     this.fillTransparentStone = fillTransparentStone;
     this.doNotSerialize = true;
   }
   getClassName() { return 'SharedEarthBlend'; }
   isReadyForSubMesh() { return this.earthTexture.isReady(); }
-  getAttributes(attributes) { attributes.push('terrainStoneUV', 'terrainBottomLight'); }
+  prepareDefines(defines, _scene, mesh) { defines.TERRAIN_AUTHORED_HEIGHT = mesh.isVerticesDataPresent('terrainAuthoredHeight'); }
+  getAttributes(attributes, _scene, mesh) {
+    attributes.push('terrainStoneUV', 'terrainBottomLight');
+    if (mesh.isVerticesDataPresent('terrainAuthoredHeight')) attributes.push('terrainAuthoredHeight');
+  }
   getSamplers(samplers) { samplers.push('terrainEarthSampler'); }
   bindForSubMesh(uniformBuffer) { uniformBuffer.setTexture('terrainEarthSampler', this.earthTexture); }
   getActiveTextures(textures) { textures.push(this.earthTexture); }
@@ -192,6 +361,9 @@ class SharedEarthBlend extends MaterialPluginBase {
       CUSTOM_VERTEX_DEFINITIONS: `
         attribute vec2 terrainStoneUV;
         attribute float terrainBottomLight;
+        #ifdef TERRAIN_AUTHORED_HEIGHT
+        attribute float terrainAuthoredHeight;
+        #endif
         varying vec2 vTerrainStoneUV;
         varying float vTerrainBottomLight;
         varying vec3 vTerrainLocalPosition;
@@ -200,6 +372,9 @@ class SharedEarthBlend extends MaterialPluginBase {
         vTerrainStoneUV = terrainStoneUV;
         vTerrainBottomLight = terrainBottomLight;
         vTerrainLocalPosition = positionUpdated;
+        #ifdef TERRAIN_AUTHORED_HEIGHT
+        vTerrainLocalPosition.y = terrainAuthoredHeight;
+        #endif
       `,
     };
     if (shaderType !== 'fragment') return null;
@@ -496,7 +671,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
   const { groundTiles } = battleTerrain;
   const activeTerrain = () => previewTerrain || battleTerrain;
   const isTileAvailable = (index) => Number.isInteger(index) && index >= 0 && index < activeTerrain().stages.length && activeTerrain().stages[index] < 3;
-  const coord = (index) => flatCoord(index).add(new Vector3(0, battleTerrain.heights[index] || 0, 0));
+  const coord = (index) => flatCoord(index).add(new Vector3(0, (battleTerrain.heights[index] || 0) - (battleTerrain.damage[index]?.crackedDepression || 0), 0));
   const viewCoord = (index) => flatCoord(index, activeTerrain().size).add(new Vector3(0, activeTerrain().heights[index] || 0, 0));
   const makeOverlayMaterial = (name, color, alpha) => {
     const m = material(name, color, color); m.disableLighting = true; m.alpha = alpha;
@@ -814,12 +989,15 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     if (terrain.damage[index]) return terrain.damage[index];
     const variant = fractureVariant++;
     const damage = fractureBlock(terrain.groundTiles[index], { variant });
-    damage.motion = createCollapseMotion(index, damage.fragments, { variant });
+    const targetHeight = terrain.tileRoots[index].position.y;
+    const clearanceFloor = Math.min(...terrain.groundTiles.map(tile => tile.getBoundingInfo().boundingBox.minimum.y * tile.scaling.y + tile.position.y + tile.parent.position.y - targetHeight));
+    damage.motion = createCollapseMotion(index, damage.fragments, { variant, clearanceFloor });
     damage.crack.material = crackMaterial; glow.addExcludedMesh(damage.crack);
-    damage.fragments.forEach(({ mesh, volume, topArea, seed }, part) => {
+    damage.fragments.forEach(({ mesh, volume, topArea, seed, columnConstraints }, part) => {
       mesh.material = fractureMaterials.get(terrain.groundTiles[index].material);
       mesh.metadata.collapseMotion = damage.motion[part];
       Object.assign(mesh.metadata, { fragmentVolume: volume, fragmentTopArea: topArea, fragmentSeed: seed });
+      mesh.metadata.columnConstraints = columnConstraints;
       shadows.addShadowCaster(mesh); glow.addExcludedMesh(mesh); soilFill.includedOnlyMeshes.push(mesh);
     });
     const dispose = damage.dispose;
@@ -827,6 +1005,7 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
     damage.dispose = () => {
       if (damageDisposed) return;
       damageDisposed = true;
+      damage.releaseCrackedShell?.();
       const meshes = new Set(damage.fragments.map(({ mesh }) => mesh));
       soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter((mesh) => !meshes.has(mesh));
       meshes.forEach((mesh) => { shadows.removeShadowCaster(mesh, false); glow.removeExcludedMesh(mesh); });
@@ -854,12 +1033,45 @@ export async function createWorld(canvas, { state, onTileClick, onHover, onViewS
       const damage = getDamage(terrain, index), tile = terrain.groundTiles[index];
       terrain.stages[index] = next;
       if (next === 1) {
+        const surface = createCrackedSurface(tile, damage.crack);
+        damage.crackedShell = surface.mesh;
+        shadows.addShadowCaster(surface.mesh); glow.addExcludedMesh(surface.mesh); soilFill.includedOnlyMeshes.push(surface.mesh);
+        damage.releaseCrackedShell = () => {
+          if (!damage.crackedShell) return;
+          const shell = damage.crackedShell;
+          shadows.removeShadowCaster(shell, false); glow.removeExcludedMesh(shell);
+          soilFill.includedOnlyMeshes = soilFill.includedOnlyMeshes.filter(mesh => mesh !== shell);
+          shell.dispose(false, false); damage.crackedShell = null;
+        };
+        tile.setEnabled(false);
+        terrain.details.filter((mesh) => mesh.parent === terrain.tileRoots[index]).forEach((mesh) => mesh.setEnabled(false));
         damage.crack.visibility = 0;
-        await animate(280, (t) => { damage.crack.visibility = ease(t); });
+        await animate(420, (t) => {
+          const progress = ease(t); surface.update(progress); damage.crack.visibility = progress;
+          damage.crackedDepression = surface.depth * progress;
+          if (terrain === battleTerrain) actors.forEach(actor => { if (actor.data.tile === index) actor.root.position.copyFrom(coord(index)); });
+        });
       } else if (next === 2) {
+        damage.releaseCrackedShell?.(); damage.crackedDepression = 0;
         tile.setEnabled(false); damage.crack.setEnabled(false);
         terrain.details.filter((mesh) => mesh.parent === terrain.tileRoots[index]).forEach((mesh) => mesh.setEnabled(false));
-        damage.fragments.forEach(({ root }) => root.setEnabled(true));
+        damage.fragments.forEach(({ root, mesh }) => {
+          // Carry the cracked depression into the disposable chunks instead of
+          // popping the central roof back up when the intact shell disappears.
+          const p = [...mesh.getVerticesData('position')], n = [...mesh.getVerticesData('normal')], colors = [...mesh.getVerticesData('color')];
+          mesh.setVerticesData('terrainAuthoredHeight', p.filter((_, i) => i % 3 === 1), false, 1);
+          for (let i = 0; i < p.length; i += 3) {
+            const [x, y, z] = p.slice(i, i + 3), h = .0001;
+            const dx = (crackDepression(x + h, y, z) - crackDepression(x - h, y, z)) / (2 * h);
+            const dy = (crackDepression(x, y + h, z) - crackDepression(x, y - h, z)) / (2 * h);
+            const dz = (crackDepression(x, y, z + h) - crackDepression(x, y, z - h)) / (2 * h);
+            const ny = n[i + 1] / (1 + dy), normal = new Vector3(n[i] - dx * ny, ny, n[i + 2] - dz * ny).normalize();
+            const dip = crackDepression(x, y, z);
+            p[i + 1] += dip; n.splice(i, 3, normal.x, normal.y, normal.z);
+            for (let j = 0; j < 3; j++) colors[i / 3 * 4 + j] *= 1 + dip / .14 * .28;
+          }
+          mesh.setVerticesData('position', p); mesh.setVerticesData('normal', n); mesh.setVerticesData('color', colors); root.setEnabled(true);
+        });
         await animate(850, (t) => {
           damage.fragments.forEach(({ root, base }, part) => {
             const motion = damage.motion[part];
